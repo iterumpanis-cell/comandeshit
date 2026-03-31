@@ -1,0 +1,15 @@
+{
+  "admin_user_id": 763451515,
+  "authorized_users": [
+    763451515,
+    911219941
+  ],
+  "pending_requests": {
+    "763451515": {
+      "user_id": 763451515,
+      "full_name": "Toni",
+      "username": null,
+      "requested_at": "2026-03-31T19:23:56"
+    }
+  }
+}

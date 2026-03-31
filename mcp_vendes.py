@@ -128,6 +128,24 @@ class MCPVendes:
             logger.warning(f"cercar_article: {e}")
             return []
 
+    async def llistar_tots_articles(self) -> list:
+        """Retorna el catàleg complet d'articles via tool dedicat del MCP."""
+        try:
+            r = await self._tool("list_all_articles", {})
+            return r if isinstance(r, list) else []
+        except Exception as e:
+            logger.warning(f"llistar_tots_articles: {e}")
+            return []
+
+    async def llistar_tots_clients(self) -> list:
+        """Retorna la llista completa de clients via tool dedicat del MCP."""
+        try:
+            r = await self._tool("list_all_clients", {})
+            return r if isinstance(r, list) else []
+        except Exception as e:
+            logger.warning(f"llistar_tots_clients: {e}")
+            return []
+
     async def vendes_dia(self, codi_botiga: int, data: str) -> dict:
         """Vendes agregades del dia. data format YYYY-MM-DD."""
         try:
