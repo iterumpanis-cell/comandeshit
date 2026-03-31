@@ -1,0 +1,928 @@
+<html><head><script>
+
+var sW = screen.width;
+var sH = screen.height;
+
+var sAW = screen.availWidth;
+var sAH = screen.availHeight;
+
+</script><script src="/Facturacion/js/roll.js"></script>
+
+
+<script>
+
+
+var hit_com = false;
+
+var hit_HW = false;
+
+var hit_sys = false;
+
+var hit_ftp = false;
+
+var GSSocket_TCPSock = false;
+
+var SCommDLL_SComm = false;
+
+var NBioBSPCOM_NBioBSP = false;
+
+var Scripting_FileSystemObject = false;
+
+var hit_Tick = false;
+
+var hit_http = false;
+
+
+function activateActiveX ( ax )
+	{
+	eval ( ax.change(".","_") + "=true" );
+	}
+
+</script>
+
+
+
+<script>
+
+// --- Obtiene el objeto window de un nombre concreto -----------------------------------------------------------------------------------
+
+function getFrame ( fIni, fName )
+	{
+	var ret = null;
+	if ( fIni.name == fName )
+		return fIni;
+	else
+		for ( var iM=0; iM<fIni.frames.length; iM++ )
+			if ( ret == null )
+				ret = getFrame ( fIni.frames[iM], fName );
+	return ret;
+	}
+
+// --- Implementación de la clase Array -------------------------------------------------------------------------------------------------
+
+Array.prototype.indexOf = arrIndexOf;
+
+function arrIndexOf ( v )
+	{
+	for ( var i=0; i<this.length; i++ )
+		if ( this[i] == v )
+			return i;
+	return -1;
+	}
+
+// --- Implementación de la clase String ------------------------------------------------------------------------------------------------
+
+String.prototype.right  = strRight;
+String.prototype.left   = strLeft;
+String.prototype.change = strChange;
+String.prototype.lTrim  = strLTrim;
+String.prototype.rTrim  = strRTrim;
+String.prototype.trim   = strTrim;
+
+function strRight(n)
+	{
+	return this.substring(this.length-n);
+	}
+
+function strLeft(n)
+	{
+	return this.substring(0,n);
+	}
+
+function strChange(a,b)
+	{
+	return this.split(a).join(b);
+	}
+
+function strLTrim()
+	{
+	var i   = 0;
+	var str = this;
+	while ( i<this.length && ( this.charAt(i)==" " || this.charAt(i)=="\t" ) )
+		{
+		i++;
+		str = this.substring(i);
+		}
+	return str;
+	}
+
+function strRTrim()
+	{
+	var i   = this.length - 1;
+	var str = this;
+	while ( i>0 && ( this.charAt(i)==" " || this.charAt(i)=="\t" ) )
+		{
+		str = this.substring(0,i);
+		i--;
+		}
+	return str;
+	}
+
+function strTrim()
+	{
+	return this.lTrim().rTrim();
+	}
+
+// --- Implementación de la clase Date --------------------------------------------------------------------------------------------------
+
+Date.prototype.dateAdd = sumaFecha;
+
+function sumaFecha(d)
+	{
+	//controlamos:
+	//* si incrementamos dias y la fecha no aumenta
+	//* si decrementamos dias y la fecha no disminuye
+	if(d>0 && (new Date(Date.parse(this)+(24*60*60*1000))).getDate()==this.getDate())d++;
+	else if(d<0 && (new Date(Date.parse(this)-(24*60*60*1000))).getDate()==this.getDate())d--;
+	return new Date(Date.parse(this)+(d*24*60*60*1000));
+	}
+
+// --- Formato --------------------------------------------------------------------------------------------------------------------------
+
+//numero,decimales --> ffloat
+function ffloat(n,d)
+	{
+
+	var n2 = parseInt(n);
+	var n3 = Math.pow(10,d);
+
+	n = Math.round((n-n2)*n3).toString();
+
+	if(n.length>d)
+		{
+		n2 += 1;
+		n = n.substring(1);
+		}
+
+	for ( var i=n.length; i<d; i++ )
+		n = "0"+n;
+
+	return parseFloat(n2+"."+n);
+
+	}
+
+//numero,decimales --> string
+function floatStr(n,d)
+	{
+
+	var n2="";
+
+	n = ffloat(n,d).toString().split(".");
+
+	if ( n.length == 1 )
+		n[1] = "";
+
+	for ( var i=n[1].length; i<d; i++ )
+		n[1]+="0";i=0;
+
+	return n.join(".");
+
+	}
+
+
+	
+</script>
+
+
+
+
+	
+		<link href="/Facturacion/Styles/" rel="stylesheet" type="text/css">
+ <link href="/Facturacion/Styles/btn" rel="stylesheet" type="text/css">
+  <link href="/Facturacion/Styles/menu-1.css" rel="stylesheet" type="text/css">
+<title> &gt; Comandes &gt; Comandes&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</title>
+	</head>
+	
+	<body onload="init();document.comanda.fecha.focus ( );document.comanda.fecha.select( );" style="background-color:#95A1C3" marginwidth="0" marginheight="0"><div id="WzTtDiV" style="visibility: hidden; position: absolute; overflow: hidden; padding: 0px; width: 0px; left: 0px; top: 0px;"></div>
+
+		<form name="comanda" method="post" target="llistaComandesNew" action="llistaComandesNewV2.asp">
+
+
+<script>
+	// CALENDARIO ------------------------------------------------------------------------------------------------------------------
+	var campo;
+	var queEnvia = "";
+
+	function showCal ( hid, que )
+	{
+		queEnvia = que;
+		campo    = hid;
+		javaCalendar ( eval ( "hid.form.btnCalendar" + hid.name ), hid, hid.value, que, event );
+	}
+
+	function diaReturn ( n, e )
+	{
+		var c = campo.value.split ( "/" );
+		var f = new Date ( c[2], c[1]-1, c[0] );
+		f = f.dateAdd ( n );
+		var FECHA = ("0" + f.getDate()).right(2) + "/" + ("0" + (f.getMonth()+1)).right(2) + "/" + f.getFullYear();
+		campo.value = FECHA;
+		eval ( "campo.form.btnCalendar" + campo.name ).value = "";
+		if ( e ) campo.form.submit();
+	}
+
+	function diaMas(c,e)
+	{
+		campo = c;
+		diaReturn ( 1, e );
+	}
+
+	function diaMenos ( c, e )
+	{
+		campo = c;
+		diaReturn ( -1, e );
+	}
+
+	var dia = ['Diumenge','Dilluns','Dimarts','Dimecres','Dijous','Divendres','Dissabte'];
+	// VALIDACIÓN CARÁCTERES -----------------------------------------------------------------------------------------------------------
+	function esNum(sEvent,El)
+	{
+		//Controlamos la entrada de carácteres númericos, mediante los códigos ASCII (. = 46, - = 45)
+		var sASCII	= sEvent.keyCode;
+		if(((sASCII > 47) && (sASCII < 58)) || (sASCII == 47)) 
+		{
+			return true;
+		}
+		else if ((sASCII == 46))
+		{
+			sEvent.keyCode = 47;
+			return true;
+		}
+		else if ((sASCII == 43) )  // +
+		{		
+			var c = El.value.split ( "/" );
+			var f = new Date ( c[2], c[1]-1, c[0] );
+			f = f.dateAdd ( 1 );
+			var FECHA = ("0" + f.getDate()).right(2) + "/" + ("0" + (f.getMonth()+1)).right(2) + "/" + f.getFullYear();
+			El.value = FECHA;
+		}
+		else if ((sASCII == 45) )  // -
+		{
+			var c = El.value.split ( "/" );
+			var f = new Date ( c[2], c[1]-1, c[0] );
+			f = f.dateAdd ( -1 );
+			var FECHA = ("0" + f.getDate()).right(2) + "/" + ("0" + (f.getMonth()+1)).right(2) + "/" + f.getFullYear();
+			El.value = FECHA;
+		}
+		else if ((sASCII == 42) )  // *
+		{
+			var c = El.value.split ( "/" );
+			var f = new Date ( c[2], c[1]-1, c[0] );
+			var ara = new Date()
+			var dies = Math.ceil((f.getTime() - ara.getTime()) / (24*60*60*1000));
+			var St =  dia[f.getDay()];
+			if (dies == -2) St = St + ' Avans d Ahir'
+			if (dies == -1) St = St + ' Ahir'
+			if (dies ==  0) St = St + ' Avui'
+			if (dies ==  1) St = St + ' Demà'
+			if (dies ==  2) St = St + ' Passat demà'
+			if (dies < -2 && dies > -7) St = St + ' Passat'
+			if (dies >  2 && dies <  7) St = St + ' Vinent'
+			alert(St);
+		}
+		else if ((sASCII == 97) )  // a
+		{
+			var ara = new Date()
+			var FECHA = ("0" + ara.getDate()).right(2) + "/" + ("0" + (ara.getMonth()+1)).right(2) + "/" + ara.getFullYear();
+			El.value = FECHA;			
+		}
+		else if ((sASCII == 13) )  // Intro
+		{
+			var form = El.form;
+			for (var i = 0 ; i < form.elements.length && form.elements[i].name != El.name; i++) ;
+			sEvent.keyCode =0;
+			form.elements[i+1].focus ( );
+			form.elements[i+1].select ( );
+			return false;
+		}
+		else if ((sASCII < 47) || (sASCII > 58))
+		{
+		}
+		sEvent.keyCode = 0;
+		return false;
+	}
+
+	// VALIDACIÓN DE FECHAS ------------------------------------------------------------------------------------------------------------
+	function esDigito(sChr)
+	{	//Controlamos la entrada de carácteres númericos
+		var sCod = sChr.charCodeAt(0);
+		return ((sCod > 47) && (sCod < 58));
+	}
+
+	function valSep(oTxt)
+	{
+		//Comprueba las diferentes combinaciones de fechas 
+		var bOk   = false;
+		var sLen  = oTxt.value;
+
+		if(oTxt.value.indexOf("/") == -1 )
+		{
+			if(sLen.length == 6)
+			{				
+				oTxt.value =  sLen.substr(0, 2) + "/" + sLen.substr(2, 2) + "/20" + sLen.substr(4, 2);
+			}
+			else if(sLen.length == 8)
+			{
+				oTxt.value =  sLen.substr(0, 2) + "/" + sLen.substr(2, 2) + "/" + sLen.substr(4, 4);
+			}
+			sLen = oTxt.value;		
+		}
+
+		if(sLen.length == 10)
+		{	// dd/mm/aaaa
+			bOk = bOk || ((oTxt.value.charAt(2) == "/") && (oTxt.value.charAt(5) == "/"));
+		}
+
+		if(sLen.length == 8)
+		{	// d/m/aaaa
+			bOk = bOk || ((oTxt.value.charAt(1) == "/") && (oTxt.value.charAt(3) == "/"));
+		}
+
+		if(sLen.length == 9)
+		{
+			if((oTxt.value.charAt(1) == "-") || (oTxt.value.charAt(1) == "/"))
+			{	// d/mm/aaaa
+				bOk = bOk || ((oTxt.value.charAt(1) == "/") && (oTxt.value.charAt(4) == "/"));
+			}
+
+			if((oTxt.value.charAt(2) == "-") || (oTxt.value.charAt(2) == "/"))
+			{	// dd/m/aaaa
+				bOk = bOk || ((oTxt.value.charAt(2) == "/") && (oTxt.value.charAt(4) == "/"));
+			}
+		}
+
+		return bOk;
+	}
+
+	function finMes(oTxt)
+	{
+		var sMes = oTxt.value.split("/");
+		var nMes = parseInt(sMes[1], 10);
+		var nRes = 0;
+		switch (nMes){
+			case 1: nRes = 31; break;
+			case 2: nRes = 29; break;
+			case 3: nRes = 31; break;
+			case 4: nRes = 30; break;
+			case 5: nRes = 31; break;
+			case 6: nRes = 30; break;
+			case 7: nRes = 31; break;
+			case 8: nRes = 31; break;
+			case 9: nRes = 30; break;
+			case 10: nRes = 31; break;
+			case 11: nRes = 30; break;
+			case 12: nRes = 31; break;
+		}
+		return nRes;
+	}
+
+	function valDia(oTxt)
+	{
+		var bOk  = false;
+		var sDia = oTxt.value.split("/");
+		var nDia = parseInt(sDia[0], 10);
+		bOk = bOk || ((nDia >= 1) && (nDia <= finMes(oTxt)));
+		return bOk;
+	}
+
+	function valMes(oTxt)	
+	{
+		var bOk   = false;
+		var sMes  = oTxt.value.split("/");
+		var nMes  = parseInt(sMes[1], 10);
+		bOk = bOk || ((nMes >= 1) && (nMes <= 12)); 
+		return bOk;
+	}
+
+	function valAno(oTxt)
+	{
+		var bOk  = true;
+		var sAno = oTxt.value.split("/");
+		var nAno = sAno[2];
+		bOk = bOk && ((nAno.length == 2) || (nAno.length == 4));
+		if (bOk){
+			for (var i = 0; i < nAno.length; i++){
+				bOk = bOk && esDigito(nAno.charAt(i));
+			}
+		}
+		return bOk;
+	}
+
+	function valFecha(oTxt)
+	{
+		var bOk = true;
+		if (oTxt.value != ""){
+			bOk = bOk && (valSep(oTxt));
+			bOk = bOk && (valAno(oTxt));
+			bOk = bOk && (valMes(oTxt));
+			bOk = bOk && (valDia(oTxt));
+			
+			if (!bOk)
+			{
+				oTxt.value = "";
+				oTxt.focus();
+			}
+			else
+			{
+				var c = oTxt.value.split ( "/" );
+				var f = new Date ( c[2], c[1]-1, c[0] );
+
+				if (eval(document.getElementById("diaSetmana"))) document.getElementById("diaSetmana").innerHTML=dia[f.getDay()];
+			}
+		}
+	}
+</script>
+	<script>
+		function TriatCliente()
+		{
+			document.comanda.submit ( );
+			canviDeClient();
+		}
+	
+		function Resalta(el)
+		{
+			el.style.backgroundColor = "#FFFFFF";
+			el.style.fontWeight = "bold";
+		}
+		
+		function DesResalta(el)
+		{
+			el.style.backgroundColor = "";
+			el.style.fontWeight = "";
+		}
+
+
+ /*
+ AJAX Functions BEGIN============================
+ */
+ 		function init()
+		{
+//			setInterval('parpadeo()', 500);
+		}
+
+		function createRequestObject() 
+		{
+			var ro;
+			var browser = navigator.appName;
+			if(browser == "Microsoft Internet Explorer")
+			{
+				ro = new ActiveXObject("Microsoft.XMLHTTP");
+			}
+			else
+			{
+				ro = new XMLHttpRequest();
+			}
+			return ro;
+		}
+		
+		var http;
+
+		function handleResponse() 
+		{
+			if (http.readyState == 4) 
+			{
+				var v = http.responseText.split(",#,");
+				document.getElementById('InfoClient').innerHTML = v[0];
+				document.getElementById('ClientComentrari').value = ''
+				if (v[1]) document.getElementById('ClientComentrari').value = v[1];
+			}	
+		}
+
+		function alertam() 
+		{
+			if (http.readyState == 4) alert(http.responseText);
+		}
+
+/*
+ AJAX Functions END============================
+*/
+
+		function ComentariGuarda() {}
+
+		function CargaClientsAmbComanda() 
+		{
+			http = createRequestObject();
+			http.open('get', '/Facturacion/include/LlistaClientsAmbComanda.asp?Data='+document.comanda.fecha.value+'&hash=' + Math.random());
+			http.onreadystatechange = handleResponseCargaClients;
+			http.send(null);
+			alert('demanat');
+		}
+	
+		function canviDeClient() 
+		{
+			http = createRequestObject();
+			http.open('get', '/Facturacion/include/informam.asp?codi='+document.getElementById('Cliente').value+'&Ordre='+document.getElementById('OrdreGraella').value+'&Data='+document.comanda.fecha.value+'&hash=' + Math.random());
+			http.onreadystatechange = handleResponse;
+			http.send(null);
+		}
+	
+
+
+		var mainFrame = getFrame ( top, "main" );
+
+		var wTec;
+		function tecnic ( )
+		{
+			wTec = window.open ( "/Facturacion/ElForn/popup/tecnic.asp", "tecnic", "width=400,height=400,top="+((screen.height-400)/2)+",left="+((screen.width-400)/2) );
+			wTec.focus ( );
+		}
+
+		var wDrv;
+		function drivers ( )
+		{
+			wDrv = window.open ( "/Facturacion/ElForn/popup/drivers.asp", "drivers", "width=400,height=600,top="+((screen.height-600)/2)+",left="+((screen.width-400)/2) );
+			wDrv.focus ( );
+		}
+
+		var wHlp;
+		function ajuda ( )
+		{
+			wHlp = window.open ( "/Facturacion/Ajuda_GDT.htm", "ajuda", "scrollbars=yes,width=" + screen.width + ",height=" + screen.height + ",top=" + ((screen.height-600)/2)+",left="+((screen.width-400)/2) );
+			wHlp.focus ( );
+		}
+
+		var wForum;
+		function forums ( foro )
+		{
+			wForum = window.open ( "/Facturacion/ElForn/forums.asp?ModoActual=0&Foro=" + foro, "forum","width=643,height=475,status=yes,top="+((screen.height-475)/2)+",left="+((screen.width-643)/2) );
+			wForum.focus ( );
+		}
+
+		function mensajeria ( )
+		{
+			window.open ( "/Facturacion/ElForn/missatges/in.asp", "main", "" );
+		}
+
+		function goHome ( )
+		{
+			window.open ( "/Facturacion/ElForn/", "main", "" );
+		}
+
+		function myDocuments ( )
+		{
+			window.open ( "/Facturacion/ElForn/file/?w=" + screen.width, "main", "" );
+		}
+
+		function estadoEnvios ( )
+		{
+			window.open ( "/Facturacion/ElForn/dades/estadoEnvios.asp?Reset=Si", "main", "" );
+		}
+
+		function cambioCodigos ( )
+		{
+			window.open ( "/Facturacion/ElForn/dades/actualizaCodigos.asp", "", "" );
+		}
+
+		var par=false;
+		function parpadeo () 
+		{
+			//document.getElementById('txt').style.visibility= (par) ? 'visible' : 'hidden';
+			document.getElementById('txt').style.color = (par) ? 'red' : 'white';
+			par = !par;
+		}
+
+		function missatgeIVA ()
+		{
+			wIVA = window.open ( "/Facturacion/ElForn/popup/missatgeIVA.asp", "IVA", "width=400,height=400,top="+((screen.height-600)/2)+",left="+((screen.width-400)/2) );
+			wIVA.focus ( );
+		}
+		
+	</script>
+	
+	<div align="center">
+		<center>
+			
+
+			<script src="/Facturacion/js/toolTips/wz_tooltip.js"></script>			
+
+				<table border="0" bordercolor="#F8F5B6" cellpadding="0" cellspacing="0" width="100%" id="tablaCabezera">
+					<tbody><tr>
+						<td class="bgtitcentro">
+							<table border="0" cellpadding="0" cellspacing="0" width="100%">
+							<tbody>
+								<tr>
+									<td rowspan="2" width="200"><img width="200" height="60" onclick="location='/Facturacion/ElForn/';" class="mano" alt="" src="/Facturacion/Foto/NoFoto.jpg"></td>
+									<td>
+										<table border="0" cellpadding="0" cellspacing="0" width="100%">
+											<tbody><tr>
+												<td align="Left" valign="bottom">
+
+													<table border="0" class="bgtitcentro">
+														<tbody><tr>
+															<td nowrap="">&nbsp;Ordr.
+																<select id="OrdreGraella" style="width:100" name="Ordre" size="1" class="txt">
+																	<option value="Familia" selected="">Familia</option>
+																	<option value="Viatge">Viaje</option>
+																	<option value="Equip">Equipo</option>
+																	<option value="Producte">Producte Codi</option>
+																	<option value="ProducteAB">Producte Alfab.</option>
+																	<option value="Demanat">Pedido</option>
+																	<option value="Servit">Servido</option>
+																	<option value="Tornat">Devoluciones</option>
+																	<option value="Tipus">Tipo</option>
+																	<option value="Modificat">Modificado</option>
+																	<option value="Comentari">Albarán</option>
+																</select>
+															</td>
+
+															<td><input type="text" value="30/03/2026" ondblclick="showCal(this.form.fecha,'');" name="fecha" id="fecha" size="11" maxlength="10" onblur="valFecha(this);" onkeypress="esNum(event,this);">
+															<script>document.comanda.fecha.onfocus = function(){parent.llistaComandesMain.location='llistaComandesMain.asp';};</script>
+
+
+															</td>
+															<td id="diaSetmana" valign="bottom" width="200" style="font-weight:normal">Dilluns</td>
+															<td>&nbsp;</td>
+															<td>
+
+<script>
+
+function getXmlHttpRequestObject() {
+	if (window.XMLHttpRequest) {
+		return new XMLHttpRequest();
+	} else if(window.ActiveXObject) {
+		return new ActiveXObject("Microsoft.XMLHTTP");
+	} else {
+		alert("Your Browser Sucks!\nIt's about time to upgrade don't you think?");
+	}
+}
+//Our XmlHttpRequest object to get the auto suggest
+var searchReq = getXmlHttpRequestObject();
+var UltimaBusqueda;
+
+//Called from keyup on the search textbox.
+//Starts the AJAX request.
+var Actual=0;
+function ResaltaActual(Resaltat){
+	var El = parent.document.getElementById('element_'+Actual);
+	if(El){
+		if (Resaltat) {
+			El.style.background="black";
+			El.style.color="white";
+			El.style.zoom="1.5";
+		}
+		else{
+			El.style.background="white";
+			El.style.color="black";
+			El.style.zoom="1";
+		}
+	}	
+}
+		
+function searchSuggestPress(Control,Tipus) {
+	UltimaBusqueda = Control;
+	var cursorKey = window.event.keyCode;
+	if (cursorKey == 13 ) {  // Intro
+		PremutIntro(Control);
+		window.event.keyCode=0;
+		}
+	if (cursorKey == 40 || cursorKey == 38) {  // Dwn
+		var Antic=Actual;
+		ResaltaActual(0);
+		if (cursorKey == 40) Actual++;   // Dwn
+		if (cursorKey == 38) Actual--;   // Up
+		var El = parent.document.getElementById('element_'+Actual);
+		if (!El) Actual = Antic;
+		ResaltaActual(1);
+		window.event.keyCode=0;
+		}
+}
+
+var GlobalPendentIntro=false;
+function PremutIntro(Control) {
+	GlobalPendentIntro=false;
+	//var x = parent.document.getElementById('element_'+Actual);
+	var x = parent.document.getElementById('element_Codi_'+Actual);
+
+	if (x && !PeticioEnCurs){
+		var n = parent.document.getElementById('element_Mostrar_'+Actual);
+		if (x.value==-1) {
+			searchSuggest(Control,"");
+			}
+		else {
+			document.getElementById('Suggest_'+Control).value = n.value;
+			document.getElementById(Control).value = x.value;
+			eval(document.getElementById(Control+"_Ok").value);
+//			document.comanda.submit ( );
+//			canviDeClient();
+			if (document.getElementById("search_suggest") == null)
+				parent.document.getElementById("search_suggest").style.visibility="hidden";
+			else
+				document.getElementById("search_suggest").style.visibility="hidden";
+			GlobalPendentIntro=false;
+			}
+		}
+	else{
+	GlobalPendentIntro=true;
+	};	
+}
+
+var UltimBuscat,UltimBuscatMaxim,UltimBuscatTipus;
+var PeticioEnCurs=false;
+function searchSuggest(Control,Tipus) {
+//	if (searchReq.readyState == 4 || searchReq.readyState == 0) {
+		var bb    = document.getElementById('Suggest_'+Control);
+		//var bb    = eval("document.comanda.Suggest_" + Control);
+		var ss    = parent.document.getElementById('search_suggest');
+		var Maxim = parent.document.getElementById('search_suggest_Resultats').value;
+		if (document.getElementById('fecha')==null)
+			var fecha = top.llistaComandesHead.document.getElementById('fecha').value;
+		else
+			var fecha = document.getElementById('fecha').value;
+		//var fecha = document.comanda.fecha.value;
+
+//		if (bb.value=="") ss.style.visibility="hidden";
+
+		if (UltimBuscat!=bb.value || UltimBuscatMaxim!=Maxim || UltimBuscatTipus!=Tipus ){
+			UltimBuscat=bb.value;
+			UltimBuscatMaxim=Maxim;
+			UltimBuscatTipus=Tipus;
+			var k = Math.random();
+			searchReq.open('GET', '/Facturacion/include/busca.asp?Fecha='+fecha+'&Control='+Control+'&Tipus='+Tipus+'&search='+escape(bb.value)+'&Maxim='+Maxim+'&Rnd='+k+'&FrameName='+self.name , true);
+			searchReq.onreadystatechange = handleSearchSuggest; 
+			PeticioEnCurs=true;
+			searchReq.send(null);
+
+//			ss.style.left = bb.style.left;
+			if(Tipus=="Clients"){
+			ss.style.left = 473;
+			ss.style.top = bb.style.top+21;
+			}
+			if(Tipus=="Articles"){
+			ss.style.left = 77;
+			ss.style.top = 87;
+			}
+			
+			ss.style.height = 30;
+			ss.style.width = bb.style.width;
+		}	
+		else {	
+		ss.style.visibility="visible";
+		}
+//	}		
+}
+var lAmago=0;
+function ValidaContingut(Camp) {
+	lAmago=1;
+	setTimeout ( "AmagaLlista()", 500 );
+ 	}
+
+function AmagaLlista(){
+		if (lAmago) parent.document.getElementById("search_suggest").style.visibility="hidden";
+	}
+
+	
+//Called when the AJAX response is returned.
+function handleSearchSuggest() {
+	if (searchReq.readyState == 4) {
+		var ss = parent.document.getElementById('search_suggest')
+		ss.innerHTML = unescape(searchReq.responseText);
+		Actual=0;
+		parent.document.getElementById("search_suggest_Clicat").value =0;
+		ResaltaActual(1);
+		ss.style.visibility="visible";
+		PeticioEnCurs=false;
+		if(GlobalPendentIntro) PremutIntro(UltimaBusqueda);
+
+//		ss.innerHTML = '';
+//		var str = searchReq.responseText.split("\n");
+//		for(i=0; i < str.length - 1; i++) {
+//			var suggest = '<div onmouseover="javascript:suggestOver(this);" ';
+//			suggest += 'onmouseout="javascript:suggestOut(this);" ';
+//			suggest += 'onclick="javascript:setSearch(this.innerHTML);" ';
+//			suggest += 'class="suggest_link">' + str[i] + '</div>';
+//			ss.innerHTML += suggest;
+//		}
+	}
+}
+
+//Mouse over function
+function suggestOver(div_value) {
+	div_value.className = 'suggest_link_over';
+}
+//Mouse out function
+function suggestOut(div_value) {
+	div_value.className = 'suggest_link';
+}
+//Click function
+function setSearch(value) {
+//	document.getElementById('txtSearch').value = value;
+	parent.document.getElementById('search_suggest').innerHTML = '';
+}
+</script>
+<input onblur="ValidaContingut(&quot;Cliente&quot;);" onfocus="searchSuggest('Cliente','Clients');" onkeydown="searchSuggestPress('Cliente','Clients');" onkeyup="searchSuggest('Cliente','Clients');" autocomplete="off" type="Text" style="width:400;" name="Suggest_Cliente" id="Suggest_Cliente" class="txtResaltat">  <input type="Hidden" name="Cliente" id="Cliente" value=""> <input type="Hidden" name="Cliente_Ok" id="Cliente_Ok" value="TriatCliente()">
+	<script>document.comanda.Suggest_Cliente.onfocus = function(){parent.llistaComandesMain.location='llistaComandesMain.asp';};</script>
+
+
+
+																<input type="Hidden" name="elejido" value="&quot; &amp; Codi &amp; &quot;">
+															</td>
+															<td>&nbsp;</td>
+															<td>
+<input type="Submit" class="btn" value="VER" name="Ver">
+															</td>
+
+
+														</tr>
+													</tbody></table>
+
+												</td>
+												<td align="left" valign="bottom" width="200">
+
+													<table border="0" cellpadding="0" cellspacing="0">
+														<tbody><tr>
+															<td></td>
+															<!--<td><span><b><font size="2"><a id="txt" style="color:#ff0000;text-decoration:none;" href="javascript:missatgeIVA()">IVA</a></font></b></span></Td>
+															<td>&nbsp;&nbsp;</td>-->
+															<td><img src="/Facturacion/ico/ElForn/carpeta.gif" width="18" height="18" alt="Mis documentos" border="0" class="mano" onclick="myDocuments();"></td>
+															<td>&nbsp;&nbsp;</td>
+															<td><img src="/Facturacion/ico/ElForn/llaveIng.gif" width="18" height="18" alt="Drivers" border="0" class="mano" onclick="drivers();"></td>
+															<td>&nbsp;&nbsp;</td>
+															<td><img src="/Facturacion/ico/ElForn/Interrogante.gif" alt="Ayuda" border="0" class="mano" onclick="ajuda();"></td>
+															<td>&nbsp;&nbsp;</td>
+															<td></td>
+															<td>&nbsp;&nbsp;</td>
+
+															<td><img src="/Facturacion/ico/ElForn/sobre.gif" width="18" height="18" border="0" alt="Mensajeria" onclick="mensajeria();" class="mano"></td>
+															<td>&nbsp;&nbsp;</td>
+															<td><img src="/Facturacion/ico/ElForn/pc.gif" border="0" width="18" height="18" alt="Datos" class="mano" onclick="estadoEnvios();"></td>
+
+															
+														</tr>
+													</tbody></table>
+
+												</td>
+											</tr>
+										</tbody></table>
+									</td>
+								</tr>
+							<tr><td>
+								<table border="0" cellpadding="0" cellspacing="0" width="100%" height="25">
+
+									<tbody><tr><td width="30%" align="left">&nbsp;<b>Nota.</b>
+<script>
+
+	function ClienteForzado(CliNom,CliCodi){
+		document.getElementById('Cliente').value=CliCodi;
+		document.getElementById('Suggest_Cliente').value=CliNom;
+		TriatCliente();
+		};
+		
+	function canviDeComentari() 
+		{
+			http = createRequestObject();
+			http.open('get', '/Facturacion/include/GuardaComentariClientData.asp?Client='+document.getElementById('Cliente').value+'&Data='+document.comanda.fecha.value+'&Comentari='+document.getElementById('ClientComentrari').value+'&hash=' + Math.random());
+			http.send(null);
+		}
+
+	function HotKeysPerNota() {
+		var cursorKey = window.event.keyCode;
+		if (cursorKey == 112 ) {  // Control
+		};
+		if (cursorKey == 17 ) {  // Control
+		canviDeComentari();
+		wDrv = window.open ( "/Facturacion/ElForn/comandes/LlistaPendents.Asp?Data="+document.comanda.fecha.value+'&hash=' + Math.random(), "Taskes", "width=500,height="+(screen.height-100)+",top=10,left="+(screen.width-510));
+		wDrv.focus ( );
+		}
+}
+		</script>
+										<input id="ClientComentrari" onblur="canviDeComentari()" type="Text" style="width:200;" name="ClientComentrari" class="txt" onkeydown="HotKeysPerNota();">
+									</td>
+
+                                                 
+
+                                    
+									<td width="100%" id="InfoClient" align="left">.</td>
+
+										</tr></tbody></table><table border="0" cellpadding="0" cellspacing="0" width="100%">
+										<tbody>
+											<tr>
+												<td height="1"></td>
+												<td class="bgtitmenu" height="1"><img height="1" width="1"></td>
+											</tr>
+											<tr>
+												<td valign="bottom" width="1"><img src="/Facturacion/img/ElForn/es.gif" width="15" height="15"></td>
+												<td class="bgmenu">
+													<table border="0" cellpadding="0" cellspacing="0" width="100%">
+													<tbody>
+														<tr>
+															<td nowrap="" class="fecha" width="30%"><a href="/Facturacion/ElForn/log.asp?modo=LOGOUT" target="_parent" class="menuopt">Usuari: </a></td>
+															<td align="right" class="fecha" width="70%" nowrap="">
+<div id="menuOk"><ul></ul></div>                                                            
+                                                            </td>
+														</tr>
+													</tbody>
+													</table>
+												</td>
+											</tr>
+										</tbody>
+										</table>
+									</td>
+								</tr>
+							</tbody></table>
+						</td>
+					</tr>
+				</tbody></table>
+		
+		
+	
+</center></div></form></body></html>
