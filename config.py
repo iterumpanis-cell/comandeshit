@@ -55,3 +55,9 @@ HEADLESS = _get_bool("HEADLESS", True)
 shop_code = os.getenv("SHOP_CODE", "").strip()
 if shop_code:
     SHOP_CODE = int(shop_code)
+
+SHOPS = {
+    "granollers": int(os.getenv("SHOP_GRANOLLERS", "884")),
+    "montornes":  int(os.getenv("SHOP_MONTORNES", "789")),
+    "montornès":  int(os.getenv("SHOP_MONTORNES", "789")),
+}

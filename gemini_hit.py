@@ -46,6 +46,7 @@ class GeminiHitAssistant:
             "aggregated_sales_day": self._aggregated_sales_day,
             "aggregated_sales_hour": self._aggregated_sales_hour,
             "print_delivery_notes": self._print_delivery_notes,
+            "list_orders_by_date": self._list_orders_by_date,
         }
 
     @property
@@ -81,6 +82,9 @@ class GeminiHitAssistant:
             f"La data d'avui es {today}. "
             "Quan la consulta sigui sobre clients, articles, comandes, albarans o vendes, usa les eines MCP disponibles "
             "en lloc d'inventar dades. No inventis codis, quantitats, resultats ni dates. "
+            "Per consultes de vendes (aggregated_sales_day, aggregated_sales_hour), usa aquests codis de botiga coneguts: "
+            "Granollers=884, Montornes=789. Si l'usuari menciona una d'aquestes botigues pel nom, usa el codi corresponent. "
+            "Si menciona una botiga desconeguda, pregunta-li el codi numeric. Mai inventis ni assumeixis cap shop_code. "
             "Per accions que modifiquen dades, com add_order o print_delivery_notes, nomes les has d'executar si la intencio "
             "de l'usuari es explicita i tens tots els parametres necessaris. Si falta alguna dada, pregunta-la de forma concreta. "
             "Si l'usuari et saluda o et fa una pregunta general, pots respondre sense eines. "
@@ -315,8 +319,27 @@ class GeminiHitAssistant:
                 },
             ),
             types.FunctionDeclaration(
+                name="list_orders_by_date",
+                description=(
+                    "Llista totes les comandes de clients tercers per a una data concreta. "
+                    "Retorna quins clients tenen comanda, les seves línies, i els totals per article. "
+                    "Usa-ho quan l'usuari vulgui saber quins clients han fet comanda per un dia, "
+                    "o per veure els totals de producció del dia."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Data en format YYYY-MM-DD.",
+                        },
+                    },
+                    "required": ["date"],
+                },
+            ),
+            types.FunctionDeclaration(
                 name="print_delivery_notes",
-                description="Envia una peticio d'impressio d'albarans.",
+                description="Envia a imprimir l'albarà d'un client a la impressora de l'obrador. Requereix data i client.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -326,14 +349,10 @@ class GeminiHitAssistant:
                         },
                         "client": {
                             "type": "integer",
-                            "description": "Codi numeric del client, opcional.",
-                        },
-                        "trip": {
-                            "type": "string",
-                            "description": "Nom o codi del viatge, opcional.",
+                            "description": "Codi numeric del client (obligatori).",
                         },
                     },
-                    "required": ["date"],
+                    "required": ["date", "client"],
                 },
             ),
         ]
@@ -389,12 +408,21 @@ class GeminiHitAssistant:
                 text = (getattr(response, "text", None) or "").strip()
                 if text:
                     return text
-                candidate = response.candidates[0].content if response.candidates else None
-                if candidate and candidate.parts:
-                    text_parts = [part.text for part in candidate.parts if getattr(part, "text", None)]
+                candidate = response.candidates[0] if response.candidates else None
+                if candidate and candidate.content and candidate.content.parts:
+                    text_parts = [part.text for part in candidate.content.parts if getattr(part, "text", None)]
                     if text_parts:
                         return "\n".join(text_parts).strip()
-                raise RuntimeError("Gemini no ha retornat cap resposta de text.")
+                finish_reason = getattr(candidate, "finish_reason", None) if candidate else None
+                logger.warning("Gemini resposta buida. finish_reason=%s", finish_reason)
+                if str(finish_reason) in ("FinishReason.SAFETY", "SAFETY", "2"):
+                    return "No puc respondre aquesta consulta per restriccions de contingut."
+                if str(finish_reason) in ("FinishReason.STOP", "STOP", "1"):
+                    # Gemini ha aturat sense text (pot passar després de tool calls).
+                    # Afegim un missatge per forçar-lo a respondre.
+                    contents.append(types.Content(role="user", parts=[types.Part(text="Respon a l'usuari amb els resultats obtinguts.")]))
+                    continue
+                return "Gemini no ha retornat cap resposta. Torna-ho a intentar."
 
             if response.candidates and response.candidates[0].content:
                 contents.append(response.candidates[0].content)
@@ -699,8 +727,11 @@ class GeminiHitAssistant:
     async def _aggregated_sales_hour(self, shop_code: int, date: str, hour: int):
         return await self.mcp.vendes_hora(shop_code, date, hour)
 
-    async def _print_delivery_notes(self, date: str, client: int | None = None, trip: str | None = None):
-        return await self.mcp.imprimir_albarans(date, client, trip)
+    async def _list_orders_by_date(self, date: str):
+        return await self.mcp.comandes_per_data(date)
+
+    async def _print_delivery_notes(self, date: str, client: int):
+        return await self.mcp.imprimir_albarans(date, client)
 
     def _format_order_ticket(self, result: dict) -> str:
         if "error" in result:

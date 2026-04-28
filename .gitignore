@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 bot.log
 bot_log.txt
+bot_state.pkl
+authorized_users.json
+.claude/

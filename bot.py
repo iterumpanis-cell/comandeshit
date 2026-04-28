@@ -11,7 +11,7 @@ from html import escape
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -37,6 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 PERSISTENCE_PATH = Path(__file__).with_name("bot_state.pkl")
 AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
+CLIENT_COPIES_PATH = Path(__file__).with_name("client_copies.json")
+
+
+def _get_copies(client_code: int) -> int:
+    """Retorna el nombre de còpies configurat per a un client. Default: 2."""
+    try:
+        data = json.loads(CLIENT_COPIES_PATH.read_text(encoding="utf-8"))
+        return int(data.get(str(client_code), data.get("_default", 2)))
+    except Exception:
+        return 2
 
 # ------------------------------------------------------------------ #
 #  Estats de la conversa                                              #
@@ -45,10 +55,12 @@ AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
     AF_CLIENT, AF_CLIENT_OPCIO, AF_DATA, AF_PRODUCTE, AF_PRODUCTE_OPCIO, AF_QUANTITAT, AF_CONFIRMAR,
     VR_CLIENT, VR_CLIENT_OPCIO, VR_DATA,
     EB_CLIENT, EB_CLIENT_OPCIO, EB_DATA, EB_PRODUCTE, EB_PRODUCTE_OPCIO, EB_CONFIRMAR,
-) = range(16)
+    IM_DATA, IM_CLIENT, IM_CLIENT_OPCIO, IM_COPIES, IM_SEGUENT,
+) = range(21)
 
-# Instància global MCP
+# Instàncies globals
 mcp = MCPVendes()
+
 ai = GeminiHitAssistant(
     config.GEMINI_API_KEY,
     config.GEMINI_MODEL,
@@ -94,6 +106,8 @@ def _parse_data(text: str) -> str | None:
     t = text.strip().lower()
     if t in ("avui", "hoy", "today", ""):
         return date.today().strftime("%d/%m/%Y")
+    if t in ("demà", "dema", "mañana", "tomorrow"):
+        return (date.today() + timedelta(days=1)).strftime("%d/%m/%Y")
 
     # Format complet DD/MM/YYYY
     try:
@@ -157,10 +171,14 @@ def _clear_pending_selection(context: ContextTypes.DEFAULT_TYPE, poll_id: str | 
 
 
 def _default_auth_data() -> dict:
-    authorized = sorted({*config.ALLOWED_USER_IDS, *( [config.ADMIN_USER_ID] if config.ADMIN_USER_ID else [])})
+    authorized = sorted({*config.ALLOWED_USER_IDS, *([config.ADMIN_USER_ID] if config.ADMIN_USER_ID else [])})
+    users = {}
+    for uid in authorized:
+        users[str(uid)] = {"role": "admin" if uid == config.ADMIN_USER_ID else "client"}
     return {
         "admin_user_id": config.ADMIN_USER_ID,
         "authorized_users": authorized,
+        "users": users,
         "pending_requests": {},
     }
 
@@ -178,6 +196,7 @@ def _load_auth_data() -> dict:
 
     data.setdefault("admin_user_id", config.ADMIN_USER_ID)
     data.setdefault("authorized_users", [])
+    data.setdefault("users", {})
     data.setdefault("pending_requests", {})
 
     if config.ADMIN_USER_ID and config.ADMIN_USER_ID not in data["authorized_users"]:
@@ -187,10 +206,20 @@ def _load_auth_data() -> dict:
             data["authorized_users"].append(uid)
 
     data["authorized_users"] = sorted({int(uid) for uid in data["authorized_users"]})
+    users = data["users"]
+    for uid in data["authorized_users"]:
+        key = str(uid)
+        users.setdefault(key, {})
+        users[key].setdefault("role", "admin" if uid == config.ADMIN_USER_ID else "client")
+    if config.ADMIN_USER_ID:
+        users.setdefault(str(config.ADMIN_USER_ID), {})
+        users[str(config.ADMIN_USER_ID)]["role"] = "admin"
     return data
 
 
 def _save_auth_data(data: dict) -> None:
+    users = data.get("users", {})
+    data["authorized_users"] = sorted({int(uid) for uid in users.keys()})
     AUTHORIZED_USERS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -202,7 +231,48 @@ def _get_admin_user_id() -> int | None:
 
 def _is_authorized_user(user_id: int) -> bool:
     data = _load_auth_data()
-    return int(user_id) in {int(uid) for uid in data.get("authorized_users", [])}
+    return str(int(user_id)) in data.get("users", {})
+
+
+def _get_user_profile(user_id: int) -> dict | None:
+    data = _load_auth_data()
+    return data.get("users", {}).get(str(int(user_id)))
+
+
+def _is_admin_user(user_id: int) -> bool:
+    profile = _get_user_profile(user_id)
+    return bool(profile and profile.get("role") == "admin")
+
+
+def _get_client_scope(user_id: int) -> tuple[int | None, str | None]:
+    profile = _get_user_profile(user_id) or {}
+    client_code = profile.get("client_code")
+    client_name = profile.get("client_name")
+    return (int(client_code) if client_code is not None else None, client_name)
+
+
+def _normalize_phone(phone: str) -> str:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if digits.startswith("34") and len(digits) > 9:
+        digits = digits[2:]
+    return digits
+
+
+async def _search_clients_by_phone(phone: str) -> list[dict]:
+    normalized = _normalize_phone(phone)
+    if not normalized:
+        return []
+
+    clients = await mcp.llistar_tots_clients()
+    if not isinstance(clients, list):
+        return []
+
+    matches = []
+    for item in clients:
+        client_phone = _normalize_phone(str(item.get("t", "")))
+        if client_phone and client_phone == normalized:
+            matches.append(item)
+    return matches
 
 
 async def _notify_admin_authorization_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -249,24 +319,116 @@ async def _notify_admin_authorization_request(update: Update, context: ContextTy
     _save_auth_data(data)
 
 
+async def _notify_admin_contact_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    full_name: str,
+    username: str | None,
+    phone: str,
+    matches: list[dict],
+) -> None:
+    data = _load_auth_data()
+    admin_id = _get_admin_user_id()
+    if not admin_id:
+        return
+
+    keyboard_rows = []
+    for match in matches[:5]:
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                f"✅ Client: {match['n'][:24]}",
+                callback_data=f"auth_client:{user_id}:{match['c']}",
+            )
+        ])
+    keyboard_rows.append([InlineKeyboardButton("🛠️ Admin Cal Forner", callback_data=f"auth_admin:{user_id}")])
+    keyboard_rows.append([InlineKeyboardButton("❌ Denegar", callback_data=f"auth_deny:{user_id}")])
+
+    username_text = f"@{username}" if username else "(sense username)"
+    if matches:
+        match_lines = "\n".join(f"- {item['n']} ({item['c']})" for item in matches[:5])
+    else:
+        match_lines = "- Cap client trobat"
+
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            "🔐 Nova sol·licitud d'accés amb contacte\n\n"
+            f"Nom: {full_name}\n"
+            f"Usuari: {username_text}\n"
+            f"ID Telegram: {user_id}\n"
+            f"Telèfon: {phone}\n\n"
+            "Coincidències MCP:\n"
+            f"{match_lines}\n\n"
+            "Decideix si entra com a client o com a administratiu de Cal Forner."
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
+    )
+
+
 async def rebuig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id if user else None
     logger.warning(f"Accés denegat a user_id={uid}")
 
-    await _notify_admin_authorization_request(update, context)
-
     text = (
         "🔒 Aquest bot només respon a usuaris autoritzats.\n"
-        "Demanaré permís a l'administrador perquè et pugui autoritzar."
+        "Per demanar accés, envia el teu contacte de Telegram amb el botó de sota."
     )
     if not _get_admin_user_id():
         text += "\n\nℹ️ Encara no hi ha cap administrador configurat."
 
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("Compartir contacte", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
     if update.message:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, reply_markup=keyboard)
     elif update.callback_query:
-        await update.callback_query.message.reply_text(text)
+        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+
+
+async def handle_contact_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+    contact = message.contact if message else None
+    if not user or not contact:
+        return
+
+    if contact.user_id and contact.user_id != user.id:
+        await message.reply_text("❌ Has d'enviar el teu propi contacte de Telegram.")
+        return
+
+    normalized_phone = _normalize_phone(contact.phone_number)
+    matches = await _search_clients_by_phone(contact.phone_number)
+    clean_matches = [m for m in matches if isinstance(m, dict) and "c" in m and "n" in m]
+
+    auth_data = _load_auth_data()
+    auth_data.setdefault("pending_requests", {})[str(user.id)] = {
+        "user_id": user.id,
+        "full_name": user.full_name,
+        "username": user.username,
+        "telegram_phone": normalized_phone,
+        "matches": clean_matches[:5],
+        "requested_at": datetime.now().isoformat(timespec="seconds"),
+        "notified_admin": True,
+    }
+    _save_auth_data(auth_data)
+
+    await _notify_admin_contact_request(
+        context,
+        user_id=user.id,
+        full_name=user.full_name,
+        username=user.username,
+        phone=normalized_phone,
+        matches=clean_matches,
+    )
+
+    await message.reply_text(
+        "✅ Sol·licitud enviada a l'administrador. Quan et doni accés, ja podràs fer servir el bot.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 def _format_order_ticket(client_name: str, order_date: str, lines: list[dict]) -> str:
@@ -328,6 +490,23 @@ def autoritzat(update: Update) -> bool:
     return _is_authorized_user(update.effective_user.id)
 
 
+def _is_admin(update: Update) -> bool:
+    return bool(update.effective_user and _is_admin_user(update.effective_user.id))
+
+
+def _bound_client(update: Update) -> tuple[int | None, str | None]:
+    if not update.effective_user:
+        return (None, None)
+    return _get_client_scope(update.effective_user.id)
+
+
+async def _deny_scope(update: Update, text: str = "❌ No tens permís per accedir a aquest client.") -> None:
+    if update.message:
+        await update.message.reply_text(text)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text)
+
+
 # ------------------------------------------------------------------ #
 #  /start i /ajuda                                                     #
 # ------------------------------------------------------------------ #
@@ -342,12 +521,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🥐 *Bot de Gestió de Comandes*\n\n"
         "Comandes disponibles:\n"
-        "• /afegir  — Afegir producte a una comanda\n"
+        "• /afegir   — Afegir producte a una comanda\n"
         "• /esborrar — Esborrar producte d'una comanda\n"
-        "• /veure   — Veure albarà d'un client\n"
-        "• /reset   — Reiniciar la conversa amb la IA\n"
-        "• /cancel  — Cancel·lar operació en curs\n"
-        "• /ajuda   — Mostrar aquesta ajuda\n\n"
+        "• /veure    — Veure albarà d'un client\n"
+        "• /imprimir — Imprimir albarans\n"
+        "• /reset    — Reiniciar la conversa amb la IA\n"
+        "• /cancel   — Cancel·lar operació en curs\n"
+        "• /ajuda    — Mostrar aquesta ajuda\n\n"
         "També pots escriure preguntes lliures o enviar una nota de veu.\n"
         "La IA usarà Gemini i les eines MCP de HitSystems quan calgui.\n\n"
         f"El teu ID de Telegram és: `{uid}`"
@@ -394,15 +574,29 @@ async def _ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         estat_msg = await update.message.reply_text("🤔 Processant...")
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    if _is_simple_greeting(prompt):
+    _TOPIC_CHANGE_KEYWORDS = ("vendes", "ventes", "sales", "imprimir", "imprim", "/vendes", "/imprimir")
+    is_topic_change = any(kw in prompt.lower() for kw in _TOPIC_CHANGE_KEYWORDS)
+
+    if _is_simple_greeting(prompt) or is_topic_change:
         history = []
         context.user_data.pop("pending_confirmation", None)
         context.user_data.pop("pending_selection", None)
     else:
         history = list(_history(context))
 
+    client_code, client_name = _bound_client(update)
+    effective_prompt = prompt
+    if not _is_admin(update) and client_code:
+        effective_prompt = (
+            f"[RESTRICCIO D'ACCÉS] Aquest usuari només pot operar sobre el client "
+            f"{client_name or client_code} (codi {client_code}). "
+            "No pots consultar ni modificar cap altre client. "
+            "Si l'usuari demana un altre client, rebutja-ho.\n\n"
+            f"{prompt}"
+        )
+
     try:
-        answer = await ai.ask(prompt, history)
+        answer = await ai.ask(effective_prompt, history)
     except Exception as e:
         logger.exception("Error cridant Gemini")
         try:
@@ -463,6 +657,15 @@ async def _handle_ai_answer(update, context, answer, estat_msg, transcript=None)
         await _tancar_estat(estat_msg)
         lines = answer.get("lines", [])
         contents = answer.get("__gemini_contents__", [])
+        client_code, client_name = _bound_client(update)
+        if not _is_admin(update) and client_code:
+            invalid = [line for line in lines if int(line.get("client", -1)) != int(client_code)]
+            if invalid:
+                await update.message.reply_text(
+                    f"❌ Només pots operar sobre les comandes de *{client_name or client_code}*.",
+                    parse_mode="Markdown",
+                )
+                return
 
         context.user_data["pending_confirmation"] = {
             "lines": lines,
@@ -515,6 +718,11 @@ async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    if text.lower() == "stop":
+        context.user_data.clear()
+        await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
+        return
+
     await _ask_ai(update, context, text)
 
 
@@ -546,6 +754,11 @@ async def ai_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         transcript = await ai.transcribe_audio(str(temp_path))
         if not transcript:
             await estat_msg.edit_text("❌ No he pogut transcriure l'àudio.")
+            return
+
+        if transcript.strip().lower() == "stop":
+            context.user_data.clear()
+            await estat_msg.edit_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.")
             return
 
         await estat_msg.edit_text("🤔 Processant...")
@@ -719,26 +932,55 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     data = query.data
 
-    if data.startswith("auth_allow:") or data.startswith("auth_deny:"):
+    if data.startswith("auth_client:") or data.startswith("auth_admin:") or data.startswith("auth_deny:"):
         admin_id = _get_admin_user_id()
         if query.from_user.id != admin_id:
             await query.message.reply_text("❌ No autoritzat.")
             return
 
-        action, user_id_text = data.split(":", 1)
-        target_user_id = int(user_id_text)
+        parts = data.split(":")
+        action = parts[0]
+        target_user_id = int(parts[1])
         auth_data = _load_auth_data()
         pending = auth_data.setdefault("pending_requests", {}).pop(str(target_user_id), None)
+        users = auth_data.setdefault("users", {})
 
-        if action == "auth_allow":
-            if target_user_id not in auth_data["authorized_users"]:
-                auth_data["authorized_users"].append(target_user_id)
-                auth_data["authorized_users"] = sorted({int(uid) for uid in auth_data["authorized_users"]})
+        if action == "auth_client":
+            client_code = int(parts[2])
+            client_name = None
+            if pending:
+                for match in pending.get("matches", []):
+                    if int(match.get("c")) == client_code:
+                        client_name = match.get("n")
+                        break
+            users[str(target_user_id)] = {
+                "role": "client",
+                "client_code": client_code,
+                "client_name": client_name or f"codi {client_code}",
+                "granted_at": datetime.now().isoformat(timespec="seconds"),
+            }
             _save_auth_data(auth_data)
-            await query.edit_message_text(f"✅ Usuari autoritzat: {target_user_id}")
+            await query.edit_message_text(f"✅ Usuari autoritzat com a client: {users[str(target_user_id)]['client_name']}")
             await context.bot.send_message(
                 chat_id=target_user_id,
-                text="✅ Ja tens accés autoritzat al bot. Pots començar a utilitzar-lo.",
+                text=(
+                    f"✅ Ja tens accés al bot com a client de {users[str(target_user_id)]['client_name']}.\n"
+                    "Només podràs veure i gestionar les teves comandes."
+                ),
+            )
+            return
+
+        if action == "auth_admin":
+            users[str(target_user_id)] = {
+                "role": "admin",
+                "scope": "Cal Forner",
+                "granted_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_auth_data(auth_data)
+            await query.edit_message_text("✅ Usuari autoritzat com a administratiu de Cal Forner")
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text="✅ Ja tens accés administratiu al bot. Pots veure i gestionar totes les dades disponibles.",
             )
             return
 
@@ -828,6 +1070,16 @@ async def af_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data.clear()
+    client_code, client_name = _bound_client(update)
+    if not _is_admin(update) and client_code:
+        context.user_data["client"] = client_name or f"codi {client_code}"
+        context.user_data["client_code"] = client_code
+        await update.message.reply_text(
+            f"📋 *Afegir producte a comanda*\n\n👤 Client fixat: *{context.user_data['client']}*",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return await _demanar_data(update)
     await update.message.reply_text(
         "📋 *Afegir producte a comanda*\n\nQuin *client*?",
         parse_mode="Markdown",
@@ -1125,6 +1377,16 @@ async def vr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data.clear()
+    client_code, client_name = _bound_client(update)
+    if not _is_admin(update) and client_code:
+        context.user_data["client"] = client_name or f"codi {client_code}"
+        context.user_data["client_code"] = client_code
+        await update.message.reply_text(
+            f"🔍 *Veure albarà*\n\n👤 Client fixat: *{context.user_data['client']}*",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return await _demanar_data_veure(update)
     await update.message.reply_text(
         "🔍 *Veure albarà*\n\nQuin *client*?",
         parse_mode="Markdown",
@@ -1289,6 +1551,16 @@ async def eb_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data.clear()
+    client_code, client_name = _bound_client(update)
+    if not _is_admin(update) and client_code:
+        context.user_data["client"] = client_name or f"codi {client_code}"
+        context.user_data["client_code"] = client_code
+        await update.message.reply_text(
+            f"🗑️ *Esborrar línia de comanda*\n\n👤 Client fixat: *{context.user_data['client']}*",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return await _demanar_data_eb(update)
     await update.message.reply_text(
         "🗑️ *Esborrar línia de comanda*\n\nQuin *client*?",
         parse_mode="Markdown",
@@ -1519,6 +1791,13 @@ async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_vendes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra les vendes agregades del dia via MCP."""
+    if not autoritzat(update):
+        await rebuig(update, context)
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Aquesta informació només està disponible per a usuaris administratius.")
+        return
+
     args = context.args
     if args and len(args) >= 2:
         try:
@@ -1562,12 +1841,156 @@ async def cmd_vendes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================================================================== #
+#  IA: Gemini (text lliure i àudio)                                    #
+# ================================================================== #
+
+# ================================================================== #
+#  /imprimir — Impressió d'albarans amb còpies per client             #
+# ================================================================== #
+
+async def im_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autoritzat(update):
+        await rebuig(update, context)
+        return ConversationHandler.END
+    context.user_data.pop("im_data", None)
+    context.user_data.pop("im_client", None)
+    context.user_data.pop("im_clients_impresos", None)
+    await update.message.reply_text(
+        "🖨️ *Impressió d'albarans*\n\nQuina data?",
+        parse_mode="Markdown",
+        reply_markup=_keyboard_dates(),
+    )
+    return IM_DATA
+
+
+async def im_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = _parse_data(update.message.text.strip())
+    if not data:
+        await update.message.reply_text("⚠️ Data no vàlida. Escriu DD/MM/AAAA o tria un botó.")
+        return IM_DATA
+    context.user_data["im_data"] = data
+    context.user_data["im_clients_impresos"] = []
+    await update.message.reply_text(
+        f"📅 Data: *{data}*\n\nEscriu el nom del client:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return IM_CLIENT
+
+
+async def im_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    resultats = await mcp.cercar_client(text)
+    if not resultats:
+        await update.message.reply_text("❌ Client no trobat. Torna a intentar-ho:")
+        return IM_CLIENT
+    if len(resultats) == 1:
+        c = resultats[0]
+        context.user_data["im_client"] = {"codi": c["c"], "nom": c["n"]}
+        copies = _get_copies(c["c"])
+        return await _im_imprimir(update, context, copies)
+    # Múltiples resultats
+    botons = [[r["n"]] for r in resultats[:10]]
+    context.user_data["im_resultats"] = resultats[:10]
+    await update.message.reply_text(
+        "Quin client?",
+        reply_markup=ReplyKeyboardMarkup(botons, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return IM_CLIENT_OPCIO
+
+
+async def im_client_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    resultats = context.user_data.get("im_resultats", [])
+    trobat = next((r for r in resultats if r["n"] == text), None)
+    if not trobat:
+        await update.message.reply_text("⚠️ Tria una opció de la llista:")
+        return IM_CLIENT_OPCIO
+    context.user_data["im_client"] = {"codi": trobat["c"], "nom": trobat["n"]}
+    copies = _get_copies(trobat["c"])
+    return await _im_imprimir(update, context, copies)
+
+
+async def _im_imprimir(update: Update, context: ContextTypes.DEFAULT_TYPE, copies: int) -> int:
+    """Obté la comanda del MCP i imprimeix directament a la impressora Star."""
+    client = context.user_data["im_client"]
+    data = context.user_data["im_data"]
+    data_mcp = _to_mcp_date(data)
+
+    estat_msg = await update.message.reply_text(
+        f"🖨️ Imprimint {copies} còpia(es) de *{client['nom']}*...",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    errors = 0
+    for i in range(copies):
+        if i > 0:
+            await asyncio.sleep(5)  # Espera entre còpies perquè la impressora acabi
+        r = await mcp.imprimir_albarans(data_mcp, client["codi"])
+        if "error" in r:
+            errors += 1
+
+    impresos = context.user_data.setdefault("im_clients_impresos", [])
+    impresos.append(f"{client['nom']} ×{copies}")
+
+    if errors:
+        await estat_msg.edit_text(f"⚠️ {client['nom']}: {errors} còpia(es) amb error.")
+    else:
+        await estat_msg.edit_text(
+            f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
+        )
+    return IM_SEGUENT
+
+
+async def im_copies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        copies = int(text)
+        if copies < 1 or copies > 10:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Escriu un número entre 1 i 10:")
+        return IM_COPIES
+    return await _im_imprimir(update, context, copies)
+
+
+async def im_seguent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "Sí" in text or "si" in text.lower():
+        await update.message.reply_text(
+            "Escriu el nom del client:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return IM_CLIENT
+
+    impresos = context.user_data.get("im_clients_impresos", [])
+    resum = "\n".join(f"• {x}" for x in impresos) if impresos else "—"
+    await update.message.reply_text(
+        f"🖨️ *Impressió completada*\n\n{resum}",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+# ================================================================== #
 #  Cancel·lar qualsevol flux                                           #
 # ================================================================== #
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Operació cancel·lada.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Para qualsevol procés en curs i torna a l'estat inicial. Funciona des de qualsevol estat."""
+    context.user_data.clear()
+    await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -1584,44 +2007,61 @@ def main():
         .build()
     )
 
+    # Filtre "stop" — text case-insensitive
+    stop_filter = filters.TEXT & filters.Regex(r"(?i)^stop$")
+    stop_handler_msg = MessageHandler(stop_filter, cmd_stop)
+
     # Flux /afegir
     afegir_handler = ConversationHandler(
         entry_points=[CommandHandler("afegir", af_start)],
         states={
-            AF_CLIENT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, af_client)],
-            AF_CLIENT_OPCIO:   [MessageHandler(filters.TEXT & ~filters.COMMAND, af_client_opcio)],
-            AF_DATA:           [MessageHandler(filters.TEXT & ~filters.COMMAND, af_data)],
-            AF_PRODUCTE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte)],
-            AF_PRODUCTE_OPCIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte_opcio)],
-            AF_QUANTITAT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, af_quantitat)],
-            AF_CONFIRMAR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, af_confirmar)],
+            AF_CLIENT:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_client)],
+            AF_CLIENT_OPCIO:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_client_opcio)],
+            AF_DATA:           [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_data)],
+            AF_PRODUCTE:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte)],
+            AF_PRODUCTE_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte_opcio)],
+            AF_QUANTITAT:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_quantitat)],
+            AF_CONFIRMAR:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_confirmar)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
     )
 
     # Flux /veure
     veure_handler = ConversationHandler(
         entry_points=[CommandHandler("veure", vr_start)],
         states={
-            VR_CLIENT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client)],
-            VR_CLIENT_OPCIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client_opcio)],
-            VR_DATA:         [MessageHandler(filters.TEXT & ~filters.COMMAND, vr_data)],
+            VR_CLIENT:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client)],
+            VR_CLIENT_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client_opcio)],
+            VR_DATA:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_data)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
     )
 
     # Flux /esborrar
     esborrar_handler = ConversationHandler(
         entry_points=[CommandHandler("esborrar", eb_start)],
         states={
-            EB_CLIENT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client)],
-            EB_CLIENT_OPCIO:  [MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client_opcio)],
-            EB_DATA:          [MessageHandler(filters.TEXT & ~filters.COMMAND, eb_data)],
-            EB_PRODUCTE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte)],
-            EB_PRODUCTE_OPCIO:[MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte_opcio)],
-            EB_CONFIRMAR:     [MessageHandler(filters.TEXT & ~filters.COMMAND, eb_confirmar)],
+            EB_CLIENT:        [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client)],
+            EB_CLIENT_OPCIO:  [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client_opcio)],
+            EB_DATA:          [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_data)],
+            EB_PRODUCTE:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte)],
+            EB_PRODUCTE_OPCIO:[stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte_opcio)],
+            EB_CONFIRMAR:     [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_confirmar)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    )
+
+    # Flux /imprimir
+    imprimir_handler = ConversationHandler(
+        entry_points=[CommandHandler("imprimir", im_start)],
+        states={
+            IM_DATA:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_data)],
+            IM_CLIENT:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client)],
+            IM_CLIENT_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client_opcio)],
+            IM_COPIES:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_copies)],
+            IM_SEGUENT:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_seguent)],
+        },
+        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1631,6 +2071,8 @@ def main():
     app.add_handler(afegir_handler)
     app.add_handler(esborrar_handler)
     app.add_handler(veure_handler)
+    app.add_handler(imprimir_handler)
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact_share))
     app.add_handler(MessageHandler(filters.VOICE, ai_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_text))
 

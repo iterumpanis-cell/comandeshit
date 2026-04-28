@@ -49,8 +49,9 @@ class MCPVendes:
             "params": params,
         }
 
+        ssl_ctx = False  # Temporalment desactivat per certificat caducat a octomes.com
         async with aiohttp.ClientSession() as http:
-            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=ssl_ctx) as resp:
                 new_sid = resp.headers.get("mcp-session-id")
                 if new_sid:
                     self._session_id = new_sid
@@ -188,15 +189,55 @@ class MCPVendes:
             logger.warning(f"afegir_linia_mcp: {e}")
             return {"error": str(e)}
 
-    async def imprimir_albarans(self, data: str, client: int | None = None, trip: str | None = None) -> dict:
-        """Encuar impressió d'albarans."""
+    async def comandes_per_data(self, data: str, concurrencia: int = 8) -> dict:
+        """Retorna totes les comandes de clients per una data.
+        Consulta tots els clients en paral·lel i retorna els que tenen comanda.
+        Format: {"clients": [...], "totals_per_article": {...}}
+        """
+        # Botigues pròpies — excloses de les comandes de clients tercers
+        BOTIGUES_PROPIES = {884, 789}  # BOT Granollers, BOTIGA 1
+
+        clients = await self.llistar_tots_clients()
+        if not clients:
+            return {"clients": [], "totals_per_article": {}}
+
+        sem = asyncio.Semaphore(concurrencia)
+
+        async def consulta_client(c):
+            async with sem:
+                codi = c.get("c") or c.get("code") or c.get("id")
+                nom = c.get("n") or c.get("name") or str(codi)
+                if codi in BOTIGUES_PROPIES:
+                    return None
+                if not codi:
+                    return None
+                try:
+                    r = await self.veure_comanda(data, codi)
+                    linies = r.get("order", [])
+                    linies_amb_qty = [l for l in linies if l.get("requested", 0) > 0]
+                    if not linies_amb_qty:
+                        return None
+                    return {"codi": codi, "nom": nom, "linies": linies_amb_qty}
+                except Exception:
+                    return None
+
+        resultats = await asyncio.gather(*[consulta_client(c) for c in clients])
+        clients_amb_comanda = [r for r in resultats if r is not None]
+
+        # Totals per article
+        totals = {}
+        for client in clients_amb_comanda:
+            for linia in client["linies"]:
+                nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
+                qty = linia.get("requested", 0)
+                totals[nom_art] = totals.get(nom_art, 0) + qty
+
+        return {"clients": clients_amb_comanda, "totals_per_article": totals}
+
+    async def imprimir_albarans(self, data: str, client: int) -> dict:
+        """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes."""
         try:
-            args = {"date": data}
-            if client:
-                args["client"] = client
-            if trip:
-                args["trip"] = trip
-            return await self._tool("print_delivery_notes", args)
+            return await self._tool("print_delivery_notes", {"date": data, "client": client})
         except Exception as e:
             logger.warning(f"imprimir_albarans: {e}")
             return {"error": str(e)}
