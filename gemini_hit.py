@@ -491,7 +491,10 @@ class GeminiHitAssistant:
         try:
             response = None
             last_error = None
-            for model_name in [self.model] + [m for m in self.fallback_models if m != self.model]:
+            # Només models que suporten àudio (gemini-2.0-flash no ho fa)
+            MODELS_AUDIO = [m for m in [self.model] + [m for m in self.fallback_models if m != self.model]
+                            if "2.0" not in m]
+            for model_name in MODELS_AUDIO:
                 try:
                     response = client.models.generate_content(
                         model=model_name,
