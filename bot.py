@@ -133,6 +133,177 @@ def _parse_data(text: str) -> str | None:
     return None
 
 
+def _next_date_for_day(day: int) -> date | None:
+    """Retorna la propera data amb aquest dia de mes."""
+    if day < 1 or day > 31:
+        return None
+
+    today = date.today()
+    year = today.year
+    month = today.month
+    for _ in range(14):
+        try:
+            candidate = date(year, month, day)
+            if candidate >= today:
+                return candidate
+        except ValueError:
+            pass
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return None
+
+
+def _parse_all_orders_date(text: str) -> str | None:
+    """Extreu una data d'una peticio tipus 'totes les comandes del dia 01'."""
+    parsed = _parse_data(text)
+    if parsed:
+        return parsed
+
+    t = text.strip().lower()
+    if re.search(r"\b(avui|hoy|today)\b", t):
+        return date.today().strftime("%d/%m/%Y")
+    if re.search(r"\b(demà|dema|mañana|tomorrow)\b", t):
+        return (date.today() + timedelta(days=1)).strftime("%d/%m/%Y")
+
+    match = re.search(r"\b(?:dia|del|pel)\s+(\d{1,2})\b", t)
+    if not match:
+        match = re.search(r"\b(\d{1,2})\b", t)
+    if not match:
+        return None
+
+    candidate = _next_date_for_day(int(match.group(1)))
+    return candidate.strftime("%d/%m/%Y") if candidate else None
+
+
+def _is_print_request(text: str) -> bool:
+    t = text.strip().lower()
+    return any(word in t for word in ("imprim", "imprimeix", "imprimir", "impressio", "impressió"))
+
+
+def _is_all_orders_request(text: str) -> bool:
+    t = text.strip().lower()
+    wants_all = any(word in t for word in ("totes", "tots", "tota", "tot el"))
+    wants_orders = any(word in t for word in ("comand", "albar"))
+    wants_plural_orders = any(word in t for word in ("comandes", "albarans"))
+    return wants_orders and (wants_all or (_is_print_request(text) and wants_plural_orders))
+
+
+def _format_all_orders_blocks(data: str, result: dict) -> list[str]:
+    """Construeix blocs HTML de totes les comandes, agrupats per client."""
+    clients = result.get("clients", [])
+    totals = result.get("totals_per_article", {})
+
+    if not clients:
+        return [f"No hi ha comandes per al {escape(data)}."]
+
+    blocks = [
+        (
+            f"<b>Comandes del {escape(data)}</b>\n"
+            f"<b>Clients:</b> {len(clients)}"
+        )
+    ]
+
+    for client in clients:
+        nom = client.get("nom") or client.get("name") or str(client.get("codi", "Client"))
+        linies = [line for line in client.get("linies", []) if line.get("requested", 0)]
+        if not linies:
+            continue
+
+        body = [f"\n<b>{escape(str(nom))}</b>"]
+        for line in linies:
+            qty = line.get("requested", 0)
+            art = line.get("nm") or line.get("artName") or line.get("name") or str(line.get("art", "?"))
+            prefix = "🎗️ " if line.get("order_type", 1) == 2 else ""
+            body.append(f"<code>{escape(prefix + str(art))} x{escape(str(qty))}</code>")
+        blocks.append("\n".join(body))
+
+    if totals:
+        total_lines = ["\n<b>Totals per article</b>"]
+        for name, qty in sorted(totals.items(), key=lambda item: str(item[0]).lower()):
+            total_lines.append(f"<code>{escape(str(name))} x{escape(str(qty))}</code>")
+        blocks.append("\n".join(total_lines))
+
+    return blocks
+
+
+async def _send_html_blocks(message, blocks: list[str], max_size: int = 3400):
+    chunk = ""
+    for block in blocks:
+        candidate = f"{chunk}\n{block}" if chunk else block
+        if len(candidate) > max_size and chunk:
+            await message.reply_text(chunk, parse_mode="HTML")
+            chunk = block
+        else:
+            chunk = candidate
+    if chunk:
+        await message.reply_text(chunk, parse_mode="HTML")
+
+
+async def _print_all_orders(update: Update, data: str) -> None:
+    data_mcp = _to_mcp_date(data)
+    estat_msg = await update.message.reply_text(f"🖨️ Carregant albarans per imprimir del {data}...")
+    logger.info("Impressio directa totes les comandes: date=%s", data_mcp)
+
+    clients = await mcp.llistar_clients_amb_comanda(data_mcp)
+    clients = [
+        c for c in clients
+        if not str(c.get("n") or c.get("name") or "").strip().upper().startswith("BOT")
+    ]
+    if not clients:
+        await estat_msg.edit_text(f"ℹ️ No hi ha comandes per imprimir el {data}.")
+        return
+
+    impresos = []
+    errors = []
+    total_copies = 0
+
+    for client in clients:
+        codi = client.get("c") or client.get("code") or client.get("id")
+        nom = client.get("n") or client.get("name") or str(codi)
+        if not codi:
+            continue
+
+        copies = _get_copies(int(codi))
+        logger.info("Imprimint albara date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
+        client_errors = 0
+        for i in range(copies):
+            if i > 0:
+                await asyncio.sleep(5)
+            result = await mcp.imprimir_albarans(data_mcp, int(codi))
+            if "error" in result:
+                client_errors += 1
+                logger.warning("Error imprimint albara date=%s client=%s copy=%s: %s", data_mcp, codi, i + 1, result)
+
+        if client_errors:
+            errors.append(f"{nom}: {client_errors}/{copies} amb error")
+        else:
+            impresos.append(f"{nom} x{copies}")
+            total_copies += copies
+
+    if errors:
+        await estat_msg.edit_text(
+            "⚠️ Impressio acabada amb errors.\n\n"
+            f"Data: {data}\n"
+            f"Enviats: {len(impresos)} clients, {total_copies} copies.\n\n"
+            "Clients enviats:\n"
+            + ("\n".join(f"- {item}" for item in impresos[:25]) if impresos else "- Cap")
+            + "\n\nErrors:\n"
+            + "\n".join(errors[:10])
+        )
+        return
+
+    await estat_msg.edit_text(
+        "✅ Albarans enviats a imprimir.\n\n"
+        f"Data: {data}\n"
+        f"Clients: {len(impresos)}\n"
+        f"Copies totals: {total_copies}\n\n"
+        "Clients enviats:\n"
+        + "\n".join(f"- {item}" for item in impresos[:25])
+    )
+
+
 def _pending_polls(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """Retorna el registre global d'enquestes pendents, indexat per poll_id."""
     return context.application.bot_data.setdefault("pending_polls", {})
@@ -581,8 +752,14 @@ async def _ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         history = []
         context.user_data.pop("pending_confirmation", None)
         context.user_data.pop("pending_selection", None)
+        ai.last_context = {}
     else:
         history = list(_history(context))
+
+    # Injecta només la data del context (mai el codi client: pot ser incorrecte si l'usuari menciona el client pel nom)
+    ctx = ai.last_context
+    if ctx and ctx.get("date") and not (_is_simple_greeting(prompt) or is_topic_change):
+        prompt = f"[Context actual: data={ctx['date']}]\n{prompt}"
 
     client_code, client_name = _bound_client(update)
     effective_prompt = prompt
@@ -723,6 +900,63 @@ async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
         return
 
+    if _is_print_queue_request(text):
+        if not _is_admin(update):
+            await update.message.reply_text("Nomes els administradors poden veure la cua d'impressio.")
+            return
+        result = await mcp.cua_impressio()
+        await update.message.reply_text(_format_print_queue(result))
+        return
+
+    print_text = _extract_print_text(text)
+    if print_text is not None:
+        await _send_print_text(update, print_text)
+        return
+
+    if _is_all_orders_request(text) and _is_print_request(text):
+        if not _is_admin(update):
+            await _deny_scope(update, "❌ Només els administradors poden imprimir totes les comandes del dia.")
+            return
+
+        data = _parse_all_orders_date(text)
+        if not data:
+            await update.message.reply_text("⚠️ Digues la data, per exemple: imprimeix totes les comandes del dia 01/05.")
+            return
+
+        try:
+            await _print_all_orders(update, data)
+        except Exception as exc:
+            logger.exception("Error imprimint totes les comandes")
+            await update.message.reply_text(f"❌ Error imprimint les comandes: {exc}")
+        return
+
+    if _is_all_orders_request(text):
+        if not _is_admin(update):
+            await _deny_scope(update, "❌ Només els administradors poden consultar totes les comandes del dia.")
+            return
+
+        data = _parse_all_orders_date(text)
+        if not data:
+            await update.message.reply_text("⚠️ Digues la data, per exemple: totes les comandes del dia 01/05.")
+            return
+
+        estat_msg = await update.message.reply_text(f"⏳ Carregant totes les comandes del {data}...")
+        data_mcp = _to_mcp_date(data)
+        logger.info("Consulta directa totes les comandes: date=%s", data_mcp)
+        try:
+            result = await mcp.comandes_per_data(data_mcp)
+            blocks = _format_all_orders_blocks(data, result)
+            await _tancar_estat(estat_msg)
+            await _send_html_blocks(update.message, blocks)
+        except Exception as exc:
+            logger.exception("Error carregant totes les comandes")
+            try:
+                await estat_msg.edit_text("❌")
+            except Exception:
+                pass
+            await update.message.reply_text(f"❌ Error carregant les comandes: {exc}")
+        return
+
     await _ask_ai(update, context, text)
 
 
@@ -777,6 +1011,7 @@ async def ai_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("ai_history", None)
+    ai.last_context = {}
     await update.message.reply_text("🧹 Conversa amb la IA reiniciada.")
 
 
@@ -1852,6 +2087,12 @@ async def im_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autoritzat(update):
         await rebuig(update, context)
         return ConversationHandler.END
+    if context.args:
+        inline_text = " ".join(context.args).strip()
+        print_text = _extract_print_text(f"imprimir {inline_text}")
+        if print_text is not None:
+            await _send_print_text(update, print_text)
+            return ConversationHandler.END
     context.user_data.pop("im_data", None)
     context.user_data.pop("im_client", None)
     context.user_data.pop("im_clients_impresos", None)
@@ -1981,6 +2222,124 @@ async def im_seguent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  Cancel·lar qualsevol flux                                           #
 # ================================================================== #
 
+def _extract_print_text(text: str) -> str | None:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    lower = cleaned.lower()
+    blocked_topics = (
+        "comanda", "comandes", "albara", "albarà", "albarans",
+        "ticket", "tiquet", "tiquets", "venda", "vendes",
+        "cua", "queue", "estat", "pendent", "pendents",
+    )
+    if any(word in lower for word in blocked_topics):
+        return None
+
+    patterns = [
+        r"(?is)^imprimeix\s+text\s*[:\-]\s*(.+)$",
+        r"(?is)^imprimir\s+text\s*[:\-]\s*(.+)$",
+        r"(?is)^imprimeix\s+text\s+(.+)$",
+        r"(?is)^imprimir\s+text\s+(.+)$",
+        r"(?is)^imprimeix\s+(?:a\s+)?(?:la\s+)?(?:impresora|impressora|star)\s*[:\-]?\s*(.+)$",
+        r"(?is)^imprimir\s+(?:a\s+)?(?:la\s+)?(?:impresora|impressora|star)\s*[:\-]?\s*(.+)$",
+        r"(?is)^imprimeix\s+a\s+la\s+star\s*[:\-]\s*(.+)$",
+        r"(?is)^imprimir\s+a\s+la\s+star\s*[:\-]\s*(.+)$",
+        r"(?is)^imprimeix\s+(?:aixo|això|esto|este\s+texto|aquest\s+text)\s*[:\-]?\s*(.+)$",
+        r"(?is)^imprimir\s+(?:aixo|això|esto|este\s+texto|aquest\s+text)\s*[:\-]?\s*(.+)$",
+    ]
+    patterns.extend([
+        r"(?is)^imprimeix\s+(.+)$",
+        r"(?is)^imprimir\s+(.+)$",
+    ])
+    for pattern in patterns:
+        match = re.match(pattern, cleaned)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _is_print_queue_request(text: str) -> bool:
+    t = text.strip().lower()
+    has_queue = any(word in t for word in ("cua", "queue", "pendent", "pendents", "estat"))
+    has_print = any(word in t for word in ("impress", "impresora", "impressora", "star"))
+    return has_queue and has_print
+
+
+def _format_print_queue(result) -> str:
+    if isinstance(result, dict) and "error" in result:
+        return f"Error cua impressio: {result['error']}"
+
+    if isinstance(result, dict):
+        jobs = (
+            result.get("jobs")
+            or result.get("queue")
+            or result.get("pending")
+            or result.get("rows")
+            or result.get("items")
+            or result.get("list")
+        )
+        if jobs is None:
+            count = result.get("count") or result.get("pending_count") or result.get("total")
+            if count in (0, "0"):
+                return "Cua d'impressio buida."
+            return f"Estat cua impressio:\n{result}"
+    else:
+        jobs = result
+
+    if not jobs:
+        return "Cua d'impressio buida."
+
+    lines = [f"Cua d'impressio - pendents: {len(jobs)}"]
+    for job in jobs[:20]:
+        if isinstance(job, dict):
+            job_id = job.get("id") or job.get("Id") or job.get("ID") or job.get("codi") or "?"
+            printer = job.get("printer") or job.get("impresora") or job.get("Impresora") or job.get("dest") or "?"
+            text = job.get("text") or job.get("Text") or job.get("missatge") or str(job)
+            lines.append(f"- #{job_id} {printer}: {str(text)[:140]}")
+        else:
+            lines.append(f"- {str(job)[:160]}")
+    if len(jobs) > 20:
+        lines.append(f"... i {len(jobs) - 20} mes")
+    return "\n".join(lines)
+
+
+async def _send_print_text(update: Update, text: str) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("Nomes els administradors poden imprimir text lliure.")
+        return
+    if not text.strip():
+        await update.message.reply_text("Text buit. Usa: /imprimir_text text a imprimir")
+        return
+
+    text_to_print = text.strip()
+    logger.info("Impressio directa text Star: len=%s preview=%r", len(text_to_print), text_to_print[:80])
+    result = await mcp.imprimir_text(text_to_print)
+    if "error" in result:
+        logger.warning("Error imprimint text Star: %s", result)
+        await update.message.reply_text(f"Error enviant a imprimir: {result['error']}")
+        return
+    await update.message.reply_text(f"Text enviat a la impressora Star:\n\n{text_to_print[:1000]}")
+
+
+async def cmd_imprimir_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autoritzat(update):
+        await rebuig(update, context)
+        return
+    await _send_print_text(update, " ".join(context.args))
+
+
+async def cmd_cua_impressio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autoritzat(update):
+        await rebuig(update, context)
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Nomes els administradors poden veure la cua d'impressio.")
+        return
+    result = await mcp.cua_impressio()
+    await update.message.reply_text(_format_print_queue(result))
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Operació cancel·lada.", reply_markup=ReplyKeyboardRemove())
@@ -2067,6 +2426,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_start))
     app.add_handler(CommandHandler("vendes", cmd_vendes))
+    app.add_handler(CommandHandler("imprimir_text", cmd_imprimir_text))
+    app.add_handler(CommandHandler("cua_impressio", cmd_cua_impressio))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(afegir_handler)
     app.add_handler(esborrar_handler)

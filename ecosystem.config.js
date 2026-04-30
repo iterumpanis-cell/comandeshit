@@ -2,9 +2,9 @@ module.exports = {
   apps: [
     {
       name: "hitsystems-bot",
-      script: "C:\\Users\\Usuario\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      script: "C:\\Users\\usuari\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
       args: "bot.py",
-      cwd: "C:\\Users\\Usuario\\CLAUDE CODE\\hitsystems-bot",
+      cwd: "C:\\botTel",
       interpreter: "none",
       autorestart: true,
       watch: false,

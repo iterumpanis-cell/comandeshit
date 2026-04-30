@@ -74,6 +74,7 @@ class MCPVendes:
 
     async def _tool(self, name: str, arguments: dict) -> dict:
         """Crida una eina MCP amb reintents si la sessió ha caducat."""
+        logger.info("MCP call: %s args=%s", name, arguments)
         async with self._lock:
             for attempt in range(2):
                 try:
@@ -85,15 +86,20 @@ class MCPVendes:
                     if content and content[0].get("type") == "text":
                         text = content[0]["text"]
                         try:
-                            return json.loads(text)
+                            parsed = json.loads(text)
+                            logger.info("MCP result: %s -> %s", name, str(parsed)[:300])
+                            return parsed
                         except Exception:
+                            logger.info("MCP result: %s -> (text) %s", name, text[:300])
                             return {"text": text}
+                    logger.info("MCP result: %s -> (raw) %s", name, str(result.get("result", {}))[:300])
                     return result.get("result", {})
                 except Exception as e:
                     if "Session not found" in str(e) or "session" in str(e).lower():
                         logger.warning(f"Sessió MCP caducada, reiniciant... (intent {attempt+1})")
                         self._session_id = None
                         continue
+                    logger.error("MCP error: %s args=%s -> %s", name, arguments, e)
                     raise
             raise RuntimeError("No s'ha pogut establir sessió MCP")
 
@@ -171,6 +177,22 @@ class MCPVendes:
             logger.warning(f"veure_comanda: {e}")
             return {"error": str(e)}
 
+    async def imprimir_text(self, text: str) -> dict:
+        """Encua text lliure a la impressora Star via MCP."""
+        try:
+            return await self._tool("print_text", {"text": text})
+        except Exception as e:
+            logger.warning(f"imprimir_text: {e}")
+            return {"error": str(e)}
+
+    async def cua_impressio(self) -> dict | list:
+        """Retorna feines pendents de la cua d'impressio MCP."""
+        try:
+            return await self._tool("get_print_queue", {})
+        except Exception as e:
+            logger.warning(f"cua_impressio: {e}")
+            return {"error": str(e)}
+
     async def afegir_linia_mcp(self, data: str, client: int, article_code: int,
                                 quantity: int, order_type: int = 1) -> dict:
         """Afegir línia de comanda via MCP.
@@ -189,16 +211,41 @@ class MCPVendes:
             logger.warning(f"afegir_linia_mcp: {e}")
             return {"error": str(e)}
 
+    async def llistar_clients_amb_comanda(self, data: str) -> list:
+        """Retorna llista de clients que tenen comanda en una data (ràpid, una sola crida MCP)."""
+        try:
+            r = await self._tool("list_order_clients", {"date": data})
+            if isinstance(r, list):
+                return r
+            if isinstance(r, dict) and isinstance(r.get("list"), list):
+                return r["list"]
+            return []
+        except Exception as e:
+            logger.warning(f"llistar_clients_amb_comanda: {e}")
+            return []
+
+    async def detall_tickets_dia(self, codi_botiga: int, data: str, limit: int = 1000, offset: int = 0) -> list:
+        """Detall de tiquets de caixa d'una botiga per dia."""
+        try:
+            args = {"shop_code": codi_botiga, "date": data, "limit": limit, "offset": offset}
+            r = await self._tool("ticket_detail_day", args)
+            return r if isinstance(r, list) else []
+        except Exception as e:
+            logger.warning(f"detall_tickets_dia: {e}")
+            return []
+
     async def comandes_per_data(self, data: str, concurrencia: int = 8) -> dict:
         """Retorna totes les comandes de clients per una data.
-        Consulta tots els clients en paral·lel i retorna els que tenen comanda.
+        Usa list_order_clients per obtenir només els clients amb comanda, després consulta cada un.
         Format: {"clients": [...], "totals_per_article": {...}}
         """
-        # Botigues pròpies — excloses de les comandes de clients tercers
-        BOTIGUES_PROPIES = {884, 789}  # BOT Granollers, BOTIGA 1
-
-        clients = await self.llistar_tots_clients()
-        if not clients:
+        clients_raw = await self.llistar_clients_amb_comanda(data)
+        clients_raw = [
+            c for c in clients_raw
+            if not str(c.get("n") or c.get("name") or "").strip().upper().startswith("BOT")
+        ]
+        logger.info("comandes_per_data: %s -> %d clients amb comanda", data, len(clients_raw))
+        if not clients_raw:
             return {"clients": [], "totals_per_article": {}}
 
         sem = asyncio.Semaphore(concurrencia)
@@ -207,11 +254,10 @@ class MCPVendes:
             async with sem:
                 codi = c.get("c") or c.get("code") or c.get("id")
                 nom = c.get("n") or c.get("name") or str(codi)
-                if codi in BOTIGUES_PROPIES:
-                    return None
                 if not codi:
                     return None
                 try:
+                    logger.info("comandes_per_data: consultant view_order date=%s client=%s (%s)", data, codi, nom)
                     r = await self.veure_comanda(data, codi)
                     linies = r.get("order", [])
                     linies_amb_qty = [l for l in linies if l.get("requested", 0) > 0]
@@ -221,10 +267,9 @@ class MCPVendes:
                 except Exception:
                     return None
 
-        resultats = await asyncio.gather(*[consulta_client(c) for c in clients])
+        resultats = await asyncio.gather(*[consulta_client(c) for c in clients_raw])
         clients_amb_comanda = [r for r in resultats if r is not None]
 
-        # Totals per article
         totals = {}
         for client in clients_amb_comanda:
             for linia in client["linies"]:
@@ -237,7 +282,7 @@ class MCPVendes:
     async def imprimir_albarans(self, data: str, client: int) -> dict:
         """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes."""
         try:
-            return await self._tool("print_delivery_notes", {"date": data, "client": client})
+            return await self._tool("print_delivery_orders", {"date": data, "client": client})
         except Exception as e:
             logger.warning(f"imprimir_albarans: {e}")
             return {"error": str(e)}

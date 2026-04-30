@@ -33,6 +33,7 @@ class GeminiHitAssistant:
         self.fallback_models = fallback_models or []
         self.mcp = mcp or MCPVendes()
         self._client = None
+        self.last_context: dict = {}  # {"client": int, "client_name": str, "date": str}
         self._tool = types.Tool(function_declarations=self._function_declarations())
         self._tool_handlers = {
             "search_client": self._search_client,
@@ -45,6 +46,8 @@ class GeminiHitAssistant:
             "add_order": self._add_order,
             "aggregated_sales_day": self._aggregated_sales_day,
             "aggregated_sales_hour": self._aggregated_sales_hour,
+            "ticket_detail_day": self._ticket_detail_day,
+            "list_order_clients": self._list_order_clients,
             "print_delivery_notes": self._print_delivery_notes,
             "list_orders_by_date": self._list_orders_by_date,
         }
@@ -85,6 +88,9 @@ class GeminiHitAssistant:
             "Per consultes de vendes (aggregated_sales_day, aggregated_sales_hour), usa aquests codis de botiga coneguts: "
             "Granollers=884, Montornes=789. Si l'usuari menciona una d'aquestes botigues pel nom, usa el codi corresponent. "
             "Si menciona una botiga desconeguda, pregunta-li el codi numeric. Mai inventis ni assumeixis cap shop_code. "
+            "IMPORTANT: 'albara', 'note', 'delivery note' i 'comanda' son sinonims i es refereixen al mateix: una order. "
+            "Per VEURE el contingut d'un albara o comanda usa SEMPRE view_order. "
+            "Usa print_delivery_notes NOMES quan l'usuari demana explicitament IMPRIMIR. "
             "Per accions que modifiquen dades, com add_order o print_delivery_notes, nomes les has d'executar si la intencio "
             "de l'usuari es explicita i tens tots els parametres necessaris. Si falta alguna dada, pregunta-la de forma concreta. "
             "Si l'usuari et saluda o et fa una pregunta general, pots respondre sense eines. "
@@ -94,6 +100,12 @@ class GeminiHitAssistant:
             "Si l'eina view_order et torna un camp telegram_format, prioritza aquest text i no el reescriguis a una taula. "
             "Si search_article no troba el producte o retorna resultats poc clars, usa suggest_articles_for_client "
             "per proposar opcions basades tant en el MCP com en altres comandes del client en dies anteriors. "
+            "IMPORTANT: quan l'usuari menciona un client i una data (p.ex. 'comanda de Cal Cabré del 01/05'), "
+            "usa PRIMER list_order_clients amb la data per obtenir la llista de clients amb comanda aquell dia, "
+            "busca el client en aquella llista i crida view_order. "
+            "Usa search_client (que consulta tots els clients) NOMES quan no hi ha cap data implicada "
+            "o quan el client no apareix a list_order_clients. "
+            "Mai assumeixis ni reutilitzis un codi de client de l'historial: el codi pot ser incorrecte. "
             "IMPORTANT: quan necessitis buscar mes d'un client a la vegada, usa SEMPRE search_clients_batch en lloc de "
             "multiples crides a search_client. De la mateixa manera, quan necessitis buscar mes d'un article, usa SEMPRE "
             "search_articles_batch en lloc de multiples crides a search_article. Agrupa totes les busquedes del mateix "
@@ -230,7 +242,7 @@ class GeminiHitAssistant:
             ),
             types.FunctionDeclaration(
                 name="view_order",
-                description="Mostra la comanda d'un client en una data concreta.",
+                description="Mostra per pantalla el contingut d'una comanda o albarà d'un client. Usa SEMPRE aquesta eina quan l'usuari vol VEURE, CONSULTAR o MOSTRAR una comanda o albarà. NO imprimeix res.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -319,12 +331,15 @@ class GeminiHitAssistant:
                 },
             ),
             types.FunctionDeclaration(
-                name="list_orders_by_date",
+                name="list_order_clients",
                 description=(
-                    "Llista totes les comandes de clients tercers per a una data concreta. "
-                    "Retorna quins clients tenen comanda, les seves línies, i els totals per article. "
-                    "Usa-ho quan l'usuari vulgui saber quins clients han fet comanda per un dia, "
-                    "o per veure els totals de producció del dia."
+                    "Retorna la llista de clients que tenen comanda en una data concreta. "
+                    "Cada entrada inclou codi, nom i nombre de línies. "
+                    "Usa SEMPRE aquesta eina quan l'usuari menciona un client i una data junts "
+                    "(p.ex. 'veure la comanda de Cal Cabré del 01/05'): "
+                    "et dona la llista de clients amb comanda aquell dia — busca el client en aquesta llista "
+                    "i crida view_order amb el codi trobat. "
+                    "Molt més ràpid que search_client quan hi ha una data implicada."
                 ),
                 parameters={
                     "type": "object",
@@ -338,8 +353,57 @@ class GeminiHitAssistant:
                 },
             ),
             types.FunctionDeclaration(
+                name="list_orders_by_date",
+                description=(
+                    "Llista totes les comandes de clients tercers per a una data concreta amb el detall complet. "
+                    "Retorna quins clients tenen comanda, les seves línies, i els totals per article. "
+                    "Usa-ho quan l'usuari vulgui veure TOTS els clients i/o els totals de producció del dia. "
+                    "Si l'usuari demana la comanda d'UN client concret, usa list_order_clients + view_order en comptes d'aquesta."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "Data en format YYYY-MM-DD.",
+                        },
+                    },
+                    "required": ["date"],
+                },
+            ),
+            types.FunctionDeclaration(
+                name="ticket_detail_day",
+                description=(
+                    "Detall de tiquets de caixa d'una botiga per un dia. "
+                    "Cada tiquet inclou les línies: article, nom, quantitat, preu, import. "
+                    "Usa quan l'usuari vol veure tiquets individuals de venda (no comandes de clients)."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "shop_code": {
+                            "type": "integer",
+                            "description": "Codi numeric de la botiga. Granollers=884, Montornes=789.",
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "Data en format YYYY-MM-DD.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Màxim de tiquets a retornar (defecte 1000).",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Tiquets a saltar per paginar (defecte 0).",
+                        },
+                    },
+                    "required": ["shop_code", "date"],
+                },
+            ),
+            types.FunctionDeclaration(
                 name="print_delivery_notes",
-                description="Envia a imprimir l'albarà d'un client a la impressora de l'obrador. Requereix data i client.",
+                description="Envia FÍSICAMENT A IMPRIMIR l'albarà a la impressora de l'obrador. Usa NOMÉS quan l'usuari demana explícitament IMPRIMIR. NO usar per veure, consultar ni mostrar.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -365,6 +429,28 @@ class GeminiHitAssistant:
             config=config["generation_config"],
         )
 
+    async def _try_generate(self, contents, generation_config, model_candidates, max_retries=3):
+        last_error = None
+        for attempt in range(max_retries):
+            for model_name in model_candidates:
+                try:
+                    return await asyncio.to_thread(
+                        self._generate_sync,
+                        contents,
+                        {"model_name": model_name, "generation_config": generation_config},
+                    )
+                except ServerError as exc:
+                    last_error = exc
+                    logger.warning("Gemini model %s ha fallat temporalment: %s", model_name, exc)
+            if attempt < max_retries - 1:
+                wait = 3 * (2 ** attempt)
+                logger.warning(
+                    "Tots els models Gemini han fallat (intent %d/%d). Reintentant en %ds...",
+                    attempt + 1, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
+        raise last_error or RuntimeError("Cap model Gemini disponible.")
+
     async def ask(self, prompt: str, history: list[dict] | None = None) -> str | dict:
         if not self.enabled:
             raise RuntimeError("GEMINI_API_KEY no configurada.")
@@ -384,24 +470,11 @@ class GeminiHitAssistant:
         )
         model_candidates = [self.model] + [m for m in self.fallback_models if m != self.model]
 
-        for _ in range(14):
-            response = None
-            last_error = None
-            for model_name in model_candidates:
-                try:
-                    response = await asyncio.to_thread(
-                        self._generate_sync,
-                        contents,
-                        {"model_name": model_name, "generation_config": generation_config},
-                    )
-                    break
-                except ServerError as exc:
-                    last_error = exc
-                    logger.warning("Gemini model %s ha fallat temporalment: %s", model_name, exc)
-                    continue
+        prev_had_tool_calls = False
+        empty_count = 0
 
-            if response is None:
-                raise last_error or RuntimeError("Cap model Gemini disponible.")
+        for _ in range(14):
+            response = await self._try_generate(contents, generation_config, model_candidates)
 
             tool_calls = list(getattr(response, "function_calls", []) or [])
             if not tool_calls:
@@ -415,14 +488,29 @@ class GeminiHitAssistant:
                         return "\n".join(text_parts).strip()
                 finish_reason = getattr(candidate, "finish_reason", None) if candidate else None
                 logger.warning("Gemini resposta buida. finish_reason=%s", finish_reason)
+                empty_count += 1
+                if empty_count > 3:
+                    return "Gemini no ha pogut completar la resposta. Torna-ho a intentar."
                 if str(finish_reason) in ("FinishReason.SAFETY", "SAFETY", "2"):
                     return "No puc respondre aquesta consulta per restriccions de contingut."
+                if str(finish_reason) in ("FinishReason.MALFORMED_FUNCTION_CALL", "MALFORMED_FUNCTION_CALL"):
+                    # Gemini ha generat una crida de funció malformada; reintentar sense afegir res.
+                    logger.warning("Gemini MALFORMED_FUNCTION_CALL (intent %d/3), reintentant...", empty_count)
+                    prev_had_tool_calls = False
+                    continue
                 if str(finish_reason) in ("FinishReason.STOP", "STOP", "1"):
-                    # Gemini ha aturat sense text (pot passar després de tool calls).
-                    # Afegim un missatge per forçar-lo a respondre.
+                    if prev_had_tool_calls:
+                        # Gemini ha aturat just després de processar eines — no afegim res, reintenta directament.
+                        prev_had_tool_calls = False
+                        continue
+                    # Gemini ha aturat sense text ni eines; forcem resposta.
                     contents.append(types.Content(role="user", parts=[types.Part(text="Respon a l'usuari amb els resultats obtinguts.")]))
+                    prev_had_tool_calls = False
                     continue
                 return "Gemini no ha retornat cap resposta. Torna-ho a intentar."
+
+            empty_count = 0
+            prev_had_tool_calls = True
 
             if response.candidates and response.candidates[0].content:
                 contents.append(response.candidates[0].content)
@@ -573,17 +661,27 @@ class GeminiHitAssistant:
             f"Format de resposta: [{{\"c\": 123, \"n\": \"Nom\"}}]"
         )
 
-        def _generate():
-            client = self._get_client()
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=[prompt],
-                config=types.GenerateContentConfig(temperature=0.0),
-            )
-            return (resp.text or "").strip()
+        async def _generate():
+            model_candidates = [self.model] + [m for m in self.fallback_models if m != self.model]
+            cfg = types.GenerateContentConfig(temperature=0.0)
+            for attempt in range(3):
+                for model_name in model_candidates:
+                    try:
+                        client = self._get_client()
+                        resp = await asyncio.to_thread(
+                            lambda mn=model_name: client.models.generate_content(
+                                model=mn, contents=[prompt], config=cfg
+                            )
+                        )
+                        return (resp.text or "").strip()
+                    except ServerError:
+                        continue
+                if attempt < 2:
+                    await asyncio.sleep(3 * (2 ** attempt))
+            return ""
 
         try:
-            text = await asyncio.to_thread(_generate)
+            text = await _generate()
             logger.info(f"_secondary_ai_search ({kind}) query='{query}' resposta: {text[:200]}")
             match = re.search(r'\[.*?\]', text, re.DOTALL)
             if match:
@@ -689,6 +787,10 @@ class GeminiHitAssistant:
     async def _view_order(self, date: str, client: int):
         result = await self.mcp.veure_comanda(date, client)
         result["telegram_format"] = self._format_order_ticket(result)
+        self.last_context["date"] = date
+        self.last_context["client"] = client
+        if result.get("client_name"):
+            self.last_context["client_name"] = result["client_name"]
         return result
 
     async def _request_user_selection(self, question: str, options: list, selection_type: str):
@@ -713,6 +815,10 @@ class GeminiHitAssistant:
         client_name: str = "?",
         article_name: str = "?",
     ):
+        self.last_context["date"] = date
+        self.last_context["client"] = client
+        if client_name and client_name != "?":
+            self.last_context["client_name"] = client_name
         return {
             NEEDS_CONFIRMATION: True,
             "date": date,
@@ -730,10 +836,18 @@ class GeminiHitAssistant:
     async def _aggregated_sales_hour(self, shop_code: int, date: str, hour: int):
         return await self.mcp.vendes_hora(shop_code, date, hour)
 
+    async def _ticket_detail_day(self, shop_code: int, date: str, limit: int = 1000, offset: int = 0):
+        return await self.mcp.detall_tickets_dia(shop_code, date, limit, offset)
+
+    async def _list_order_clients(self, date: str):
+        return await self.mcp.llistar_clients_amb_comanda(date)
+
     async def _list_orders_by_date(self, date: str):
         return await self.mcp.comandes_per_data(date)
 
     async def _print_delivery_notes(self, date: str, client: int):
+        self.last_context["date"] = date
+        self.last_context["client"] = client
         return await self.mcp.imprimir_albarans(date, client)
 
     def _format_order_ticket(self, result: dict) -> str:
