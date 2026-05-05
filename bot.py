@@ -885,6 +885,8 @@ async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rebuig(update, context)
         return
 
+    if not update.message or not update.message.text:
+        return
     text = update.message.text.strip()
     if not text:
         return
@@ -2197,14 +2199,24 @@ async def _im_imprimir(update: Update, context: ContextTypes.DEFAULT_TYPE, copie
     impresos = context.user_data.setdefault("im_clients_impresos", [])
     impresos.append(f"{client['nom']} ×{copies}")
 
-    if errors:
-        await estat_msg.edit_text(f"⚠️ {client['nom']}: {errors} còpia(es) amb error.")
-    else:
-        await estat_msg.edit_text(
-            f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
-        )
+    try:
+        if errors:
+            await estat_msg.edit_text(f"⚠️ {client['nom']}: error d'impressió.")
+        else:
+            await estat_msg.edit_text(
+                f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
+            )
+    except Exception:
+        if errors:
+            await update.message.reply_text(f"⚠️ {client['nom']}: error d'impressió.")
+        else:
+            await update.message.reply_text(
+                f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
+            )
     return IM_SEGUENT
 
 
