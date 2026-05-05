@@ -49,9 +49,8 @@ class MCPVendes:
             "params": params,
         }
 
-        ssl_ctx = False  # Temporalment desactivat per certificat caducat a octomes.com
         async with aiohttp.ClientSession() as http:
-            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=ssl_ctx) as resp:
+            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 new_sid = resp.headers.get("mcp-session-id")
                 if new_sid:
                     self._session_id = new_sid

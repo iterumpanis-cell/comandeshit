@@ -2345,8 +2345,13 @@ async def _send_print_text(update: Update, text: str) -> None:
         await update.message.reply_text("Text buit. Usa: /imprimir_text text a imprimir")
         return
 
-    text_to_print = text.strip()
-    logger.info("Impressio directa text Star: len=%s preview=%r", len(text_to_print), text_to_print[:80])
+    # ESC/POS: init + doble alçada i amplada + text + mida normal + avanç paper
+    ESC_INIT   = "\x1b\x40"       # inicialitza impressora
+    ESC_DOBLE  = "\x1d\x21\x66"   # 7x amplada + 7x alçada
+    ESC_NORMAL = "\x1d\x21\x00"   # mida normal
+    content = text.strip().upper()
+    text_to_print = ESC_INIT + ESC_DOBLE + content + ESC_NORMAL + "\n\n\n"
+    logger.info("Impressio directa text Star: len=%s preview=%r", len(content), content[:80])
     result = await mcp.imprimir_text(text_to_print)
     if "error" in result:
         logger.warning("Error imprimint text Star: %s", result)

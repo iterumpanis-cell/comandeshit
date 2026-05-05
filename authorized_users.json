@@ -2,14 +2,24 @@
   "admin_user_id": 763451515,
   "authorized_users": [
     763451515,
-    911219941
+    911219941,
+    5269048043
   ],
-  "pending_requests": {
+  "users": {
     "763451515": {
-      "user_id": 763451515,
-      "full_name": "Toni",
-      "username": null,
-      "requested_at": "2026-03-31T19:23:56"
+      "role": "admin",
+      "scope": "Cal Forner"
+    },
+    "911219941": {
+      "role": "admin",
+      "scope": "Cal Forner",
+      "granted_at": "2026-03-31T20:14:32"
+    },
+    "5269048043": {
+      "role": "admin",
+      "scope": "Cal Forner",
+      "granted_at": "2026-04-04T18:42:36"
     }
-  }
+  },
+  "pending_requests": {}
 }
