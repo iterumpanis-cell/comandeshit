@@ -280,9 +280,15 @@ class MCPVendes:
         return {"clients": clients_amb_comanda, "totals_per_article": totals}
 
     async def imprimir_albarans(self, data: str, client: int, copies: int = 1) -> dict:
-        """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes."""
+        """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes.
+        El servidor ignora el camp 'copies', per tant fem N crides d'1 còpia."""
         try:
-            return await self._tool("print_delivery_orders", {"date": data, "client": client, "copies": copies})
+            last = {}
+            for _ in range(max(1, copies)):
+                last = await self._tool("print_delivery_orders", {"date": data, "client": client, "copies": 1})
+                if "error" in last:
+                    return last
+            return last
         except Exception as e:
             logger.warning(f"imprimir_albarans: {e}")
             return {"error": str(e)}
