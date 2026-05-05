@@ -279,10 +279,10 @@ class MCPVendes:
 
         return {"clients": clients_amb_comanda, "totals_per_article": totals}
 
-    async def imprimir_albarans(self, data: str, client: int) -> dict:
+    async def imprimir_albarans(self, data: str, client: int, copies: int = 1) -> dict:
         """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes."""
         try:
-            return await self._tool("print_delivery_orders", {"date": data, "client": client})
+            return await self._tool("print_delivery_orders", {"date": data, "client": client, "copies": copies})
         except Exception as e:
             logger.warning(f"imprimir_albarans: {e}")
             return {"error": str(e)}

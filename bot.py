@@ -56,7 +56,8 @@ def _get_copies(client_code: int) -> int:
     VR_CLIENT, VR_CLIENT_OPCIO, VR_DATA,
     EB_CLIENT, EB_CLIENT_OPCIO, EB_DATA, EB_PRODUCTE, EB_PRODUCTE_OPCIO, EB_CONFIRMAR,
     IM_DATA, IM_CLIENT, IM_CLIENT_OPCIO, IM_COPIES, IM_SEGUENT,
-) = range(21)
+    IM_TIPUS, IM_TEXT,
+) = range(23)
 
 # Instàncies globals
 mcp = MCPVendes()
@@ -267,17 +268,10 @@ async def _print_all_orders(update: Update, data: str) -> None:
 
         copies = _get_copies(int(codi))
         logger.info("Imprimint albara date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
-        client_errors = 0
-        for i in range(copies):
-            if i > 0:
-                await asyncio.sleep(5)
-            result = await mcp.imprimir_albarans(data_mcp, int(codi))
-            if "error" in result:
-                client_errors += 1
-                logger.warning("Error imprimint albara date=%s client=%s copy=%s: %s", data_mcp, codi, i + 1, result)
-
-        if client_errors:
-            errors.append(f"{nom}: {client_errors}/{copies} amb error")
+        result = await mcp.imprimir_albarans(data_mcp, int(codi), copies)
+        if "error" in result:
+            logger.warning("Error imprimint albara date=%s client=%s: %s", data_mcp, codi, result)
+            errors.append(f"{nom}: error")
         else:
             impresos.append(f"{nom} x{copies}")
             total_copies += copies
@@ -2097,11 +2091,36 @@ async def im_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("im_client", None)
     context.user_data.pop("im_clients_impresos", None)
     await update.message.reply_text(
-        "🖨️ *Impressió d'albarans*\n\nQuina data?",
+        "🖨️ *Impressió*\n\nQue vols imprimir?",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(
+            [["📋 Albarans"], ["✏️ Text lliure"]],
+            one_time_keyboard=True, resize_keyboard=True,
+        ),
+    )
+    return IM_TIPUS
+
+
+async def im_tipus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "Text lliure" in text:
+        await update.message.reply_text(
+            "✏️ Escriu el text que vols imprimir:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return IM_TEXT
+    await update.message.reply_text(
+        "📋 *Albarans* — Quina data?",
         parse_mode="Markdown",
         reply_markup=_keyboard_dates(),
     )
     return IM_DATA
+
+
+async def im_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    await _send_print_text(update, text)
+    return ConversationHandler.END
 
 
 async def im_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2112,15 +2131,22 @@ async def im_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["im_data"] = data
     context.user_data["im_clients_impresos"] = []
     await update.message.reply_text(
-        f"📅 Data: *{data}*\n\nEscriu el nom del client:",
+        f"📅 Data: *{data}*\n\nImprimeixo tots els clients o un de concret?",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=ReplyKeyboardMarkup(
+            [["🖨️ Tots els clients"], ["👤 Un client concret"]],
+            one_time_keyboard=True, resize_keyboard=True,
+        ),
     )
     return IM_CLIENT
 
 
 async def im_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if "Tots els clients" in text:
+        data = context.user_data["im_data"]
+        await _print_all_orders(update, data)
+        return ConversationHandler.END
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     resultats = await mcp.cercar_client(text)
     if not resultats:
@@ -2165,13 +2191,8 @@ async def _im_imprimir(update: Update, context: ContextTypes.DEFAULT_TYPE, copie
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    errors = 0
-    for i in range(copies):
-        if i > 0:
-            await asyncio.sleep(5)  # Espera entre còpies perquè la impressora acabi
-        r = await mcp.imprimir_albarans(data_mcp, client["codi"])
-        if "error" in r:
-            errors += 1
+    r = await mcp.imprimir_albarans(data_mcp, client["codi"], copies)
+    errors = 1 if "error" in r else 0
 
     impresos = context.user_data.setdefault("im_clients_impresos", [])
     impresos.append(f"{client['nom']} ×{copies}")
@@ -2414,11 +2435,13 @@ def main():
     imprimir_handler = ConversationHandler(
         entry_points=[CommandHandler("imprimir", im_start)],
         states={
+            IM_TIPUS:        [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_tipus)],
             IM_DATA:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_data)],
             IM_CLIENT:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client)],
             IM_CLIENT_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client_opcio)],
             IM_COPIES:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_copies)],
             IM_SEGUENT:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_seguent)],
+            IM_TEXT:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_text)],
         },
         fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
     )
