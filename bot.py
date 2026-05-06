@@ -279,9 +279,10 @@ async def _print_all_orders(update: Update, data: str) -> None:
                 if qty > 0:
                     totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
 
+    totals_lines = sorted(totals_articles.items(), key=lambda x: x[0].lower())
     totals_txt = "\n\nTotals per producte:\n" + "\n".join(
-        f"- {art}: {qty}" for art, qty in sorted(totals_articles.items(), key=lambda x: x[0].lower())
-    ) if totals_articles else ""
+        f"- {art}: {qty}" for art, qty in totals_lines
+    ) if totals_lines else ""
 
     if errors:
         await estat_msg.edit_text(
@@ -294,17 +295,28 @@ async def _print_all_orders(update: Update, data: str) -> None:
             + "\n".join(errors[:10])
             + totals_txt
         )
-        return
+    else:
+        await estat_msg.edit_text(
+            "✅ Albarans enviats a imprimir.\n\n"
+            f"Data: {data}\n"
+            f"Clients: {len(impresos)}\n"
+            f"Copies totals: {total_copies}\n\n"
+            "Clients enviats:\n"
+            + "\n".join(f"- {item}" for item in impresos[:25])
+            + totals_txt
+        )
 
-    await estat_msg.edit_text(
-        "✅ Albarans enviats a imprimir.\n\n"
-        f"Data: {data}\n"
-        f"Clients: {len(impresos)}\n"
-        f"Copies totals: {total_copies}\n\n"
-        "Clients enviats:\n"
-        + "\n".join(f"- {item}" for item in impresos[:25])
-        + totals_txt
-    )
+    if totals_lines:
+        sep = "-" * 28
+        linies_impressora = [
+            "TOTALS PRODUCCIO",
+            f"Data: {data}",
+            sep,
+        ] + [f"{art}: {qty}" for art, qty in totals_lines] + [
+            sep,
+            f"Total unitats: {sum(q for _, q in totals_lines)}",
+        ]
+        await mcp.imprimir_text("\n".join(linies_impressora))
 
 
 def _pending_polls(context: ContextTypes.DEFAULT_TYPE) -> dict:
