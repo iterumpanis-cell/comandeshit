@@ -50,7 +50,7 @@ class MCPVendes:
         }
 
         async with aiohttp.ClientSession() as http:
-            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as resp:
                 new_sid = resp.headers.get("mcp-session-id")
                 if new_sid:
                     self._session_id = new_sid
@@ -211,17 +211,21 @@ class MCPVendes:
             return {"error": str(e)}
 
     async def llistar_clients_amb_comanda(self, data: str) -> list:
-        """Retorna llista de clients que tenen comanda en una data (ràpid, una sola crida MCP)."""
+        """Retorna llista de clients que tenen comanda en una data.
+        Intenta list_order_clients (ràpid); si falla o retorna buit, usa list_all_clients com a fallback."""
         try:
             r = await self._tool("list_order_clients", {"date": data})
+            clients = None
             if isinstance(r, list):
-                return r
-            if isinstance(r, dict) and isinstance(r.get("list"), list):
-                return r["list"]
-            return []
+                clients = r
+            elif isinstance(r, dict) and isinstance(r.get("list"), list):
+                clients = r["list"]
+            if clients:
+                return clients
+            logger.info("llistar_clients_amb_comanda: list_order_clients buit, fallback a list_all_clients")
         except Exception as e:
-            logger.warning(f"llistar_clients_amb_comanda: {e}")
-            return []
+            logger.warning(f"llistar_clients_amb_comanda list_order_clients: {e}, fallback a list_all_clients")
+        return await self.llistar_tots_clients()
 
     async def detall_tickets_dia(self, codi_botiga: int, data: str, limit: int = 1000, offset: int = 0) -> list:
         """Detall de tiquets de caixa d'una botiga per dia."""

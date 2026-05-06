@@ -247,11 +247,8 @@ async def _print_all_orders(update: Update, data: str) -> None:
     estat_msg = await update.message.reply_text(f"🖨️ Carregant albarans per imprimir del {data}...")
     logger.info("Impressio directa totes les comandes: date=%s", data_mcp)
 
-    clients = await mcp.llistar_clients_amb_comanda(data_mcp)
-    clients = [
-        c for c in clients
-        if not str(c.get("n") or c.get("name") or "").strip().upper().startswith("BOT")
-    ]
+    resultat = await mcp.comandes_per_data(data_mcp)
+    clients = resultat.get("clients", [])
     if not clients:
         await estat_msg.edit_text(f"ℹ️ No hi ha comandes per imprimir el {data}.")
         return
@@ -261,8 +258,8 @@ async def _print_all_orders(update: Update, data: str) -> None:
     total_copies = 0
 
     for client in clients:
-        codi = client.get("c") or client.get("code") or client.get("id")
-        nom = client.get("n") or client.get("name") or str(codi)
+        codi = client.get("codi")
+        nom = client.get("nom", str(codi))
         if not codi:
             continue
 
