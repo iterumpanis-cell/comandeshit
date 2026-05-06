@@ -28,13 +28,14 @@ class MCPVendes:
         self._session_id: str | None = None
         self._lock = asyncio.Lock()
         self._req_id = 0
+        self._use_ssl = True
 
     def _next_id(self) -> int:
         self._req_id += 1
         return self._req_id
 
     async def _call(self, method: str, params: dict) -> dict:
-        """Crida al servidor MCP."""
+        """Crida al servidor MCP. Si el certificat SSL ha caducat, desactiva la verificació automàticament."""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -49,16 +50,25 @@ class MCPVendes:
             "params": params,
         }
 
-        async with aiohttp.ClientSession() as http:
-            async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as resp:
-                new_sid = resp.headers.get("mcp-session-id")
-                if new_sid:
-                    self._session_id = new_sid
-                text = await resp.text()
-                data = _parse_sse(text)
-                if data is None:
-                    raise ValueError(f"Resposta inesperada: {text[:200]}")
-                return data
+        for ssl_attempt in range(2):
+            try:
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=self._use_ssl) as resp:
+                        new_sid = resp.headers.get("mcp-session-id")
+                        if new_sid:
+                            self._session_id = new_sid
+                        text = await resp.text()
+                        data = _parse_sse(text)
+                        if data is None:
+                            raise ValueError(f"Resposta inesperada: {text[:200]}")
+                        return data
+            except aiohttp.ClientConnectorCertificateError:
+                if ssl_attempt == 0 and self._use_ssl:
+                    logger.warning("Certificat SSL d'octomes.com caducat — desactivant verificació SSL automàticament")
+                    self._use_ssl = False
+                    continue
+                raise
+        raise RuntimeError("No s'ha pogut connectar al servidor MCP")
 
     async def _ensure_session(self):
         """Inicialitza sessió si no n'hi ha."""
