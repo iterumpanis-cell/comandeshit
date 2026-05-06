@@ -5,6 +5,7 @@ Protocol: MCP Streamable HTTP amb sessions (mcp-session-id header)
 import asyncio
 import json
 import logging
+import time
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ class MCPVendes:
         self._lock = asyncio.Lock()
         self._req_id = 0
         self._use_ssl = True
+        self._ssl_disabled_at: float | None = None
+        self._SSL_RETRY_INTERVAL = 24 * 3600  # torna a provar SSL cada 24h
 
     def _next_id(self) -> int:
         self._req_id += 1
@@ -50,6 +53,13 @@ class MCPVendes:
             "params": params,
         }
 
+        # Si fa >24h que SSL està desactivat, torna a provar-lo
+        if not self._use_ssl and self._ssl_disabled_at and (time.time() - self._ssl_disabled_at) > self._SSL_RETRY_INTERVAL:
+            logger.info("Han passat 24h — tornant a provar amb SSL activat")
+            self._use_ssl = True
+            self._ssl_disabled_at = None
+            self._session_id = None
+
         for ssl_attempt in range(2):
             try:
                 async with aiohttp.ClientSession() as http:
@@ -66,6 +76,8 @@ class MCPVendes:
                 if ssl_attempt == 0 and self._use_ssl:
                     logger.warning("Certificat SSL d'octomes.com caducat — desactivant verificació SSL automàticament")
                     self._use_ssl = False
+                    self._ssl_disabled_at = time.time()
+                    self._session_id = None
                     continue
                 raise
         raise RuntimeError("No s'ha pogut connectar al servidor MCP")
