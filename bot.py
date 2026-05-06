@@ -256,6 +256,7 @@ async def _print_all_orders(update: Update, data: str) -> None:
     impresos = []
     errors = []
     total_copies = 0
+    totals_articles = {}
 
     for client in clients:
         codi = client.get("codi")
@@ -272,6 +273,15 @@ async def _print_all_orders(update: Update, data: str) -> None:
         else:
             impresos.append(f"{nom} x{copies}")
             total_copies += copies
+            for linia in client.get("linies", []):
+                nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
+                qty = linia.get("requested", 0)
+                if qty > 0:
+                    totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
+
+    totals_txt = "\n\nTotals per producte:\n" + "\n".join(
+        f"- {art}: {qty}" for art, qty in sorted(totals_articles.items(), key=lambda x: x[0].lower())
+    ) if totals_articles else ""
 
     if errors:
         await estat_msg.edit_text(
@@ -282,6 +292,7 @@ async def _print_all_orders(update: Update, data: str) -> None:
             + ("\n".join(f"- {item}" for item in impresos[:25]) if impresos else "- Cap")
             + "\n\nErrors:\n"
             + "\n".join(errors[:10])
+            + totals_txt
         )
         return
 
@@ -292,6 +303,7 @@ async def _print_all_orders(update: Update, data: str) -> None:
         f"Copies totals: {total_copies}\n\n"
         "Clients enviats:\n"
         + "\n".join(f"- {item}" for item in impresos[:25])
+        + totals_txt
     )
 
 
