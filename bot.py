@@ -307,15 +307,15 @@ async def _print_all_orders(update: Update, data: str) -> None:
         )
 
     if totals_lines:
-        sep = "-" * 28
-        linies_impressora = [
-            "TOTALS PRODUCCIO",
-            f"Data: {data}",
-            sep,
-        ] + [f"{art}: {qty}" for art, qty in totals_lines] + [
-            sep,
-            f"Total unitats: {sum(q for _, q in totals_lines)}",
-        ]
+        W = 32
+        sep = "-" * W
+        total_u = sum(q for _, q in totals_lines)
+        linies_impressora = ["TOTALS PRODUCCIO", f"Data: {data}", sep]
+        for art, qty in totals_lines:
+            qty_str = str(qty)
+            nom = art[:W - len(qty_str) - 1]
+            linies_impressora.append(f"{nom:<{W - len(qty_str) - 1}} {qty_str}")
+        linies_impressora += [sep, f"Total unitats: {total_u}"]
         await mcp.imprimir_text("\n".join(linies_impressora))
 
 
