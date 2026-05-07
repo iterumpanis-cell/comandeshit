@@ -315,7 +315,7 @@ async def _print_all_orders(update: Update, data: str) -> None:
             qty_str = str(qty)
             nom = art[:W - len(qty_str) - 1]
             linies_impressora.append(f"{nom:<{W - len(qty_str) - 1}} {qty_str}")
-        linies_impressora += [sep, f"Total unitats: {total_u}"]
+        linies_impressora += [sep, f"Total unitats: {total_u}", "", "", "", ""]
         await mcp.imprimir_text("\n".join(linies_impressora))
 
 
