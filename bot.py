@@ -26,6 +26,7 @@ from telegram.ext import (
 import config
 from gemini_hit import GeminiHitAssistant, NEEDS_SELECTION, NEEDS_CONFIRMATION
 from mcp_vendes import MCPVendes
+from printer import _format_totals_escpos
 
 # ------------------------------------------------------------------ #
 #  Logging                                                             #
@@ -307,16 +308,9 @@ async def _print_all_orders(update: Update, data: str) -> None:
         )
 
     if totals_lines:
-        W = 32
-        sep = "-" * W
-        total_u = sum(q for _, q in totals_lines)
-        linies_impressora = ["TOTALS PRODUCCIO", f"Data: {data}", sep]
-        for art, qty in totals_lines:
-            qty_str = str(qty)
-            nom = art[:W - len(qty_str) - 1]
-            linies_impressora.append(f"{nom:<{W - len(qty_str) - 1}} {qty_str}")
-        linies_impressora += [sep, f"Total unitats: {total_u}", "", "", "", ""]
-        await mcp.imprimir_text("\n".join(linies_impressora))
+        totals_dict = {art: qty for art, qty in totals_lines}
+        text_escpos = _format_totals_escpos(data, totals_dict, len(impresos))
+        await mcp.imprimir_text(text_escpos)
 
 
 def _pending_polls(context: ContextTypes.DEFAULT_TYPE) -> dict:

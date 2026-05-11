@@ -27,6 +27,68 @@ DOUBLE_OFF  = GS  + b'!\x00'
 CUT         = GS  + b'V\x41\x03'  # tall parcial amb feed
 LF          = b'\n'
 
+# Font size: GS ! n (n = (width_mag << 4) | height_mag)
+# 0=1x 1=2x 2=3x 3=4x 4=5x 5=6x 6=7x 7=8x
+FONT_7X     = GS  + b'\x66'   # 7x ample + 7x alt
+FONT_RESET  = GS  + b'!\x00'
+
+# Text ESC/POS per incrustar en crides MCP imprimir_text
+ESC_STR     = '\x1b'
+GS_STR      = '\x1d'
+LF_STR      = '\n'
+FONT_7X_STR = GS_STR + '!\x66'
+FONT_RESET_STR = GS_STR + '!\x00'
+BOLD_ON_STR = ESC_STR + 'E\x01'
+BOLD_OFF_STR = ESC_STR + 'E\x00'
+CENTER_STR  = ESC_STR + 'a\x01'
+LEFT_STR    = ESC_STR + 'a\x00'
+CUT_STR     = GS_STR  + 'V\x41\x03'
+
+
+def _format_totals_escpos(data: str, totals: dict, clients_count: int) -> str:
+    """Retorna text amb ESC/POS incrustat per al resum de produccio.
+    El header (titol) surt amb font size 7x.
+    """
+    W = 28
+    sep = "-" * W
+    total_u = sum(totals.values())
+    sorted_items = sorted(totals.items(), key=lambda x: x[0].lower())
+
+    body = ""
+    body += CENTER_STR
+    body += FONT_7X_STR
+    body += BOLD_ON_STR
+    body += "ITERUM PANIS" + LF_STR
+    body += BOLD_OFF_STR
+    body += FONT_RESET_STR
+    body += f"RESUM PRODUCCIO {data}" + LF_STR
+    body += LF_STR
+
+    body += LEFT_STR
+    body += sep + LF_STR
+    body += BOLD_ON_STR
+    body += f"{'QTY':>4}  {'ARTICLE':<22}" + LF_STR
+    body += BOLD_OFF_STR
+    body += sep + LF_STR
+
+    for art, qty in sorted_items:
+        qty_str = str(qty)
+        nom = art[:22] if len(art) > 22 else art
+        body += f"{qty_str:>4}  {nom:<22}" + LF_STR
+
+    body += sep + LF_STR
+    body += BOLD_ON_STR
+    body += f"TOTAL UNITATS: {total_u}" + LF_STR
+    body += BOLD_OFF_STR
+    body += LF_STR
+
+    body += CENTER_STR
+    body += f"Clients: {clients_count}" + LF_STR
+    body += LF_STR + LF_STR + LF_STR
+    body += CUT_STR
+
+    return body
+
 
 def _encode(text: str) -> bytes:
     return text.encode("cp858", errors="replace")
