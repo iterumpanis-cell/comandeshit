@@ -143,6 +143,25 @@ def _format_ticket(client_name: str, data: str, linies: list) -> bytes:
     return bytes(buf)
 
 
+async def imprimir_text_directe(text_escpos: str) -> dict:
+    """Envia text ESC/POS directament a la impressora per TCP.
+    Així evitem la corrupcio de caracters de control per CP1252/JSON del MCP."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(PRINTER_IP, PRINTER_PORT),
+            timeout=TIMEOUT,
+        )
+        writer.write(_encode(text_escpos))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        return {"ok": True}
+    except asyncio.TimeoutError:
+        return {"error": f"Timeout connectant a {PRINTER_IP}:{PRINTER_PORT}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 async def imprimir_albara(client_name: str, data: str, linies: list, copies: int = 1) -> dict:
     """
     Envia l'albarà directament a la impressora Star via TCP.

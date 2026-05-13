@@ -1,5 +1,5 @@
 """
-print_resum.py — Imprimeix resum per productes d'una data amb font size x7
+print_resum.py — Imprimeix resum per productes d'una data amb font size x7 directe per TCP
 Us: python print_resum.py [DATA]    (DATA per defecte: 12/05/2026)
 """
 import asyncio
@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp_vendes import MCPVendes
-from printer import _format_totals_escpos
+from printer import _format_totals_escpos, imprimir_text_directe
 
 
 async def main():
@@ -27,13 +27,13 @@ async def main():
         return
 
     text_escpos = _format_totals_escpos(data, totals, len(clients))
-    res = await mcp.imprimir_text(text_escpos)
+    res = await imprimir_text_directe(text_escpos)
 
     if "error" in res:
         print(f"Error d'impressio: {res['error']}")
     else:
         total_u = sum(totals.values())
-        print(f"Resum enviat a imprimir: {total_u} unitats, {len(totals)} productes")
+        print(f"Resum enviat a imprimir: {total_u} unitats, {len(totals)} productes, {len(clients)} clients")
 
 
 if __name__ == "__main__":

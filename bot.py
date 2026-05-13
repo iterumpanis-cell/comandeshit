@@ -8,7 +8,7 @@ import logging
 import re
 import tempfile
 from html import escape
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from pathlib import Path
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
@@ -26,7 +26,7 @@ from telegram.ext import (
 import config
 from gemini_hit import GeminiHitAssistant, NEEDS_SELECTION, NEEDS_CONFIRMATION
 from mcp_vendes import MCPVendes
-from printer import _format_totals_escpos
+from printer import _format_totals_escpos, imprimir_text_directe
 
 # ------------------------------------------------------------------ #
 #  Logging                                                             #
@@ -310,7 +310,7 @@ async def _print_all_orders(update: Update, data: str) -> None:
     if totals_lines:
         totals_dict = {art: qty for art, qty in totals_lines}
         text_escpos = _format_totals_escpos(data, totals_dict, len(impresos))
-        await mcp.imprimir_text(text_escpos)
+        await imprimir_text_directe(text_escpos)
 
 
 def _pending_polls(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -2407,6 +2407,115 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------ #
+#  Auto enviament programat                                            #
+# ------------------------------------------------------------------ #
+
+async def _notify_auto_all_users(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Envia un missatge a tots els usuaris autoritzats (admin + usuaris)."""
+    auth_data = _load_auth_data()
+    user_ids = set(auth_data.get("authorized_users", []))
+    admin_id = _get_admin_user_id()
+    if admin_id:
+        user_ids.add(admin_id)
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("No s'ha pogut notificar l'usuari %s: %s", uid, e)
+
+
+async def auto_envia_comandes(context: ContextTypes.DEFAULT_TYPE):
+    """Tasca programada que imprimeix albarans del dia següent i notifica tots els usuaris autoritzats."""
+    dema = date.today() + timedelta(days=1)
+    data_display = dema.strftime("%d/%m/%Y")
+    data_mcp = dema.strftime("%Y-%m-%d")
+
+    logger.info("Auto enviament: iniciant per al %s", data_display)
+
+    try:
+        resultat = await mcp.comandes_per_data(data_mcp)
+    except Exception as e:
+        logger.exception("Auto enviament: error MCP per al %s", data_display)
+        await _notify_auto_all_users(context, f"❌ Error auto enviament del {escape(data_display)}: {escape(str(e))}")
+        return
+
+    clients = resultat.get("clients", [])
+    if not clients:
+        msg = f"ℹ️ Auto enviament: no hi ha comandes per al {escape(data_display)}."
+        logger.info(msg)
+        await _notify_auto_all_users(context, msg)
+        return
+
+    impresos: list[str] = []
+    errors: list[str] = []
+    total_copies = 0
+    totals_articles: dict[str, int] = {}
+
+    for client in clients:
+        codi = client.get("codi")
+        nom = client.get("nom", str(codi))
+        if not codi:
+            continue
+
+        copies = _get_copies(int(codi))
+        logger.info("Auto enviament: imprimint date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
+        try:
+            result = await mcp.imprimir_albarans(data_mcp, int(codi), copies)
+            if "error" in result:
+                logger.warning("Auto enviament error: date=%s client=%s: %s", data_mcp, codi, result)
+                errors.append(f"{nom}: error")
+            else:
+                impresos.append(f"{nom} x{copies}")
+                total_copies += copies
+                for linia in client.get("linies", []):
+                    nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
+                    qty = linia.get("requested", 0)
+                    if qty > 0:
+                        totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
+        except Exception as e:
+            logger.exception("Auto enviament excepcio: client=%s", codi)
+            errors.append(f"{nom}: {e}")
+
+    totals_lines = sorted(totals_articles.items(), key=lambda x: x[0].lower())
+    totals_txt = ""
+    if totals_lines:
+        totals_txt = "\n\n<b>Resum productes:</b>\n" + "\n".join(
+            f"• {escape(art)}: {qty}" for art, qty in totals_lines
+        )
+
+    if errors:
+        summary = (
+            "⚠️ <b>Comandes enviades amb errors.</b>\n\n"
+            f"📅 {escape(data_display)}\n"
+            f"Clients enviats: {len(impresos)}\n"
+            f"Còpies totals: {total_copies}\n\n"
+            "<b>Clients enviats:</b>\n"
+            + ("\n".join(f"• {item}" for item in impresos[:25]) if impresos else "- Cap")
+            + "\n\n<b>Errors:</b>\n"
+            + "\n".join(f"• {e}" for e in errors[:10])
+            + totals_txt
+        )
+    else:
+        summary = (
+            "✅ <b>Comandes enviades automàticament.</b>\n\n"
+            f"📅 {escape(data_display)}\n"
+            f"Clients: {len(impresos)}\n"
+            f"Còpies totals: {total_copies}\n\n"
+            "<b>Clients enviats:</b>\n"
+            + "\n".join(f"• {item}" for item in impresos[:25])
+            + totals_txt
+        )
+
+    logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
+    await _notify_auto_all_users(context, summary)
+
+    if totals_lines:
+        totals_dict = {art: qty for art, qty in totals_lines}
+        text_escpos = _format_totals_escpos(data_display, totals_dict, len(impresos))
+        await imprimir_text_directe(text_escpos)
+
+
+# ------------------------------------------------------------------ #
 #  Main                                                                #
 # ------------------------------------------------------------------ #
 
@@ -2495,6 +2604,20 @@ def main():
     from telegram.ext import PollAnswerHandler, CallbackQueryHandler as TGCallbackQueryHandler
     app.add_handler(TGCallbackQueryHandler(handle_callback_query))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    # Tasques programades
+    app.job_queue.run_daily(
+        auto_envia_comandes,
+        time=time(18, 0),
+        days=(0, 1, 2, 3, 4),
+        name="auto_envia_feiner",
+    )
+    app.job_queue.run_daily(
+        auto_envia_comandes,
+        time=time(13, 0),
+        days=(5, 6),
+        name="auto_envia_caps",
+    )
 
     logger.info("=" * 50)
     logger.info("  Bot HitSystems actiu. Ctrl+C per aturar.")
