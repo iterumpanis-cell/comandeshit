@@ -1,15 +1,18 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import unicodedata
 from html import escape
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from google import genai
 from google.genai import types
 from google.genai.errors import ServerError
+from faster_whisper import WhisperModel
 
 from mcp_vendes import MCPVendes
 
@@ -33,6 +36,9 @@ class GeminiHitAssistant:
         self.fallback_models = fallback_models or []
         self.mcp = mcp or MCPVendes()
         self._client = None
+        self._whisper_model = None
+        self._whisper_device = "auto"
+        self._whisper_compute = "int8"
         self.last_context: dict = {}  # {"client": int, "client_name": str, "date": str}
         self._tool = types.Tool(function_declarations=self._function_declarations())
         self._tool_handlers = {
@@ -571,7 +577,38 @@ class GeminiHitAssistant:
     async def transcribe_audio(self, file_path: str) -> str:
         if not self.enabled:
             raise RuntimeError("GEMINI_API_KEY no configurada.")
-        return await asyncio.to_thread(self._transcribe_audio_sync, file_path)
+        try:
+            return await self._transcribe_audio_local(file_path)
+        except Exception as e:
+            logger.warning("Transcripcio local ha fallat, provant amb Gemini: %s", e)
+            return await asyncio.to_thread(self._transcribe_audio_sync, file_path)
+
+    def _get_whisper_model(self):
+        if self._whisper_model is None:
+            logger.info("Carregant model faster-whisper (base)...")
+            self._whisper_model = WhisperModel(
+                "base",
+                device=self._whisper_device,
+                compute_type=self._whisper_compute,
+            )
+            logger.info("Model faster-whisper carregat")
+        return self._whisper_model
+
+    async def _transcribe_audio_local(self, file_path: str) -> str:
+        model = self._get_whisper_model()
+
+        def _transcriure():
+            segs, _ = model.transcribe(file_path, language="ca", beam_size=5)
+            parts = []
+            for s in segs:
+                parts.append(s.text.strip())
+            return " ".join(parts).strip()
+
+        result = await asyncio.to_thread(_transcriure)
+        if not result:
+            raise RuntimeError("Whisper no ha transcrit res")
+        logger.info("Transcripcio local: %s", result[:100])
+        return result
 
     def _transcribe_audio_sync(self, file_path: str) -> str:
         client = self._get_client()
