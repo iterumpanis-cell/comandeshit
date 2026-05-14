@@ -9,6 +9,7 @@ import re
 import tempfile
 from html import escape
 from datetime import date, datetime, timedelta, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
@@ -2605,16 +2606,17 @@ def main():
     app.add_handler(TGCallbackQueryHandler(handle_callback_query))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    # Tasques programades
+    # Tasques programades (amb zona horaria Europe/Madrid)
+    _TZ = ZoneInfo("Europe/Madrid")
     app.job_queue.run_daily(
         auto_envia_comandes,
-        time=time(18, 0),
+        time=time(18, 0, tzinfo=_TZ),
         days=(0, 1, 2, 3, 4),
         name="auto_envia_feiner",
     )
     app.job_queue.run_daily(
         auto_envia_comandes,
-        time=time(13, 0),
+        time=time(13, 0, tzinfo=_TZ),
         days=(5, 6),
         name="auto_envia_caps",
     )
