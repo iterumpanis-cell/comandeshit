@@ -3,16 +3,16 @@ bot.py — Bot de Telegram per a la gestió de comandes HitSystems
 Tot via MCP: cerca clients, cerca articles, afegir (normal i encarrec), veure comanda.
 """
 import asyncio
+import argparse
 import json
 import logging
 import re
 import tempfile
 from html import escape
-from datetime import date, datetime, timedelta, time
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, Bot
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -2411,7 +2411,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  Auto enviament programat                                            #
 # ------------------------------------------------------------------ #
 
-async def _notify_auto_all_users(context: ContextTypes.DEFAULT_TYPE, text: str):
+async def _notify_auto_all_users(bot: Bot, text: str):
     """Envia un missatge a tots els usuaris autoritzats (admin + usuaris)."""
     auth_data = _load_auth_data()
     user_ids = set(auth_data.get("authorized_users", []))
@@ -2420,13 +2420,18 @@ async def _notify_auto_all_users(context: ContextTypes.DEFAULT_TYPE, text: str):
         user_ids.add(admin_id)
     for uid in user_ids:
         try:
-            await context.bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
+            await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
         except Exception as e:
             logger.warning("No s'ha pogut notificar l'usuari %s: %s", uid, e)
 
 
-async def auto_envia_comandes(context: ContextTypes.DEFAULT_TYPE):
-    """Tasca programada que imprimeix albarans del dia següent i notifica tots els usuaris autoritzats."""
+async def auto_envia_comandes():
+    """Executa una passada d'autoenviament per ser cridada des d'un cron extern."""
+    async with Bot(token=config.TELEGRAM_TOKEN) as bot:
+        await _run_auto_envia_comandes(bot)
+
+
+async def _run_auto_envia_comandes(bot: Bot):
     dema = date.today() + timedelta(days=1)
     data_display = dema.strftime("%d/%m/%Y")
     data_mcp = dema.strftime("%Y-%m-%d")
@@ -2437,14 +2442,14 @@ async def auto_envia_comandes(context: ContextTypes.DEFAULT_TYPE):
         resultat = await mcp.comandes_per_data(data_mcp)
     except Exception as e:
         logger.exception("Auto enviament: error MCP per al %s", data_display)
-        await _notify_auto_all_users(context, f"❌ Error auto enviament del {escape(data_display)}: {escape(str(e))}")
+        await _notify_auto_all_users(bot, f"❌ Error auto enviament del {escape(data_display)}: {escape(str(e))}")
         return
 
     clients = resultat.get("clients", [])
     if not clients:
         msg = f"ℹ️ Auto enviament: no hi ha comandes per al {escape(data_display)}."
         logger.info(msg)
-        await _notify_auto_all_users(context, msg)
+        await _notify_auto_all_users(bot, msg)
         return
 
     impresos: list[str] = []
@@ -2508,7 +2513,7 @@ async def auto_envia_comandes(context: ContextTypes.DEFAULT_TYPE):
         )
 
     logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
-    await _notify_auto_all_users(context, summary)
+    await _notify_auto_all_users(bot, summary)
 
     if totals_lines:
         totals_dict = {art: qty for art, qty in totals_lines}
@@ -2520,7 +2525,7 @@ async def auto_envia_comandes(context: ContextTypes.DEFAULT_TYPE):
 #  Main                                                                #
 # ------------------------------------------------------------------ #
 
-def main():
+def run_bot():
     persistence = PicklePersistence(filepath=str(PERSISTENCE_PATH))
     app = (
         Application.builder()
@@ -2606,26 +2611,33 @@ def main():
     app.add_handler(TGCallbackQueryHandler(handle_callback_query))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    # Tasques programades (amb zona horaria Europe/Madrid)
-    _TZ = ZoneInfo("Europe/Madrid")
-    app.job_queue.run_daily(
-        auto_envia_comandes,
-        time=time(18, 0, tzinfo=_TZ),
-        days=(0, 1, 2, 3, 4),
-        name="auto_envia_feiner",
-    )
-    app.job_queue.run_daily(
-        auto_envia_comandes,
-        time=time(13, 0, tzinfo=_TZ),
-        days=(5, 6),
-        name="auto_envia_caps",
-    )
-
     logger.info("=" * 50)
     logger.info("  Bot HitSystems actiu. Ctrl+C per aturar.")
     logger.info("=" * 50)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+def main(mode: str = "bot"):
+    if mode == "bot":
+        run_bot()
+        return
+    if mode in {"auto_envia", "auto-envia", "cron"}:
+        asyncio.run(auto_envia_comandes())
+        return
+    raise ValueError(f"Mode desconegut: {mode}")
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Bot HitSystems")
+    parser.add_argument(
+        "--mode",
+        default="bot",
+        choices=("bot", "auto_envia", "auto-envia", "cron"),
+        help="Mode d'execucio: bot normal o passada d'autoenviament per cron extern.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+    main(args.mode)

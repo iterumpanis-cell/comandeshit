@@ -50,6 +50,14 @@ pm2.cmd logs hitsystems-bot
 pm2.cmd restart hitsystems-bot --update-env
 ```
 
+L'autoenviament programat tambe surt de `bot.py`, pero com a execucio puntual per cron extern de PM2:
+
+```powershell
+python bot.py --mode auto_envia
+```
+
+Els horaris es defineixen a `ecosystem.config.js` amb `cron_restart`, no dins el bot.
+
 ## Seguretat
 
 - Només respon a usuaris autoritzats.
