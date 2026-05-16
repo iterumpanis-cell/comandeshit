@@ -8,6 +8,8 @@ import json
 import logging
 import re
 import tempfile
+import unicodedata
+from difflib import SequenceMatcher
 from html import escape
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -178,6 +180,45 @@ def _parse_all_orders_date(text: str) -> str | None:
 
     candidate = _next_date_for_day(int(match.group(1)))
     return candidate.strftime("%d/%m/%Y") if candidate else None
+
+
+def _normalize_search_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", without_accents.lower()).strip()
+
+
+def _article_match_score(query: str, article_name: str) -> float:
+    query_norm = _normalize_search_text(query)
+    name_norm = _normalize_search_text(article_name)
+    if not query_norm or not name_norm:
+        return 0.0
+    if query_norm == name_norm:
+        return 1.0
+    if query_norm in name_norm or name_norm in query_norm:
+        return 0.9
+
+    query_tokens = set(re.findall(r"[a-z0-9]+", query_norm))
+    name_tokens = set(re.findall(r"[a-z0-9]+", name_norm))
+    token_score = len(query_tokens & name_tokens) / len(query_tokens) if query_tokens else 0.0
+    ratio = SequenceMatcher(None, query_norm, name_norm).ratio()
+    return max(ratio, token_score)
+
+
+async def _fallback_article_options(text: str, limit: int = 8) -> list[tuple[str, int]]:
+    articles = await mcp.llistar_tots_articles()
+    ranked = []
+    for item in articles:
+        name = item.get("n") or item.get("name")
+        code = item.get("c") or item.get("code") or item.get("id")
+        if not name or code is None:
+            continue
+        score = _article_match_score(text, str(name))
+        if score >= 0.45:
+            ranked.append((score, str(name), int(code)))
+
+    ranked.sort(key=lambda item: (-item[0], item[1].lower()))
+    return [(name, code) for _, name, code in ranked[:limit]]
 
 
 def _is_print_request(text: str) -> bool:
@@ -1461,6 +1502,16 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"af_producte: cercar_article excepció: {e}")
         resultats = []
+    fallback_used = False
+    if not resultats:
+        try:
+            fallback_options = await _fallback_article_options(text)
+            if fallback_options:
+                fallback_used = True
+                resultats = [{"n": name, "c": code} for name, code in fallback_options]
+                logger.info("af_producte: fallback cataleg per %r -> %s", text, fallback_options)
+        except Exception as e:
+            logger.warning("af_producte: fallback cataleg excepcio per %r: %s", text, e)
     try:
         await cerca_msg.delete()
     except Exception:
@@ -1476,8 +1527,8 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AF_PRODUCTE
 
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
+    text_norm = _normalize_search_text(text)
+    coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
 
     if len(coincidencies) == 1:
         name, code = coincidencies[0]
@@ -1512,7 +1563,7 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[n] for n, _ in llista]
     keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
     await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* productes per «{text}».\nSelecciona el correcte:",
+        f"🔍 He trobat *{len(llista)}* productes {'semblants ' if fallback_used else ''}per «{text}».\nSelecciona el correcte:",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
