@@ -2980,7 +2980,10 @@ def run_bot():
 
     # Flux /vendes
     vendes_handler = ConversationHandler(
-        entry_points=[CommandHandler("vendes", cmd_vendes)],
+        entry_points=[
+            CommandHandler("vendes", cmd_vendes),
+            MessageHandler(filters.TEXT & filters.Regex(r"(?i)^\s*(vendes|ventas|ventes)\s*$"), cmd_vendes),
+        ],
         states={
             VD_SHOP:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_shop)],
             VD_DATE:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_date)],
