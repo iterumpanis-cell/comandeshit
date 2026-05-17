@@ -105,6 +105,24 @@ def _keyboard_dates() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
 
 
+def _keyboard_sales_dates() -> ReplyKeyboardMarkup:
+    """Botonera per vendes: avui i dies enrere + opcio manual."""
+    avui = date.today()
+    buttons = []
+    row = []
+    for i in range(0, 8):
+        d = avui - timedelta(days=i)
+        prefix = "Avui" if i == 0 else DIES_CA[d.weekday()]
+        row.append(f"{prefix} {d.strftime('%d/%m/%Y')}")
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(["✏️ Data lliure (dd/mm/aaaa)"])
+    return ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
+
+
 def _parse_data(text: str) -> str | None:
     """Parseja text de data i retorna DD/MM/YYYY o None si error.
     Accepta: 'avui', 'DD/MM/YYYY', botó 'Dij 03/04' (afegeix any automàticament).
@@ -2396,7 +2414,7 @@ async def vd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shop_name = f"Botiga {shop_code}"
 
     context.user_data["vendes"] = {"shop_code": shop_code, "shop_name": shop_name}
-    await update.message.reply_text("📅 Tria la data:", reply_markup=_keyboard_dates())
+    await update.message.reply_text("📅 Tria la data:", reply_markup=_keyboard_sales_dates())
     return VD_DATE
 
 
@@ -2405,6 +2423,10 @@ async def vd_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("❌"):
         await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
+
+    if "data lliure" in _normalize_search_text(text):
+        await update.message.reply_text("✏️ Escriu la data de vendes en format dd/mm/aaaa:", reply_markup=ReplyKeyboardRemove())
+        return VD_DATE
 
     parsed = _parse_sales_date(text)
     if not parsed:
