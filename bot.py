@@ -285,6 +285,128 @@ async def _send_html_blocks(message, blocks: list[str], max_size: int = 3400):
         await message.reply_text(chunk, parse_mode="HTML")
 
 
+def _parse_sales_date(text: str) -> tuple[str, str] | None:
+    iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if iso_match:
+        data_mcp = iso_match.group(0)
+        y, m, d = iso_match.groups()
+        return data_mcp, f"{d}/{m}/{y}"
+
+    date_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", text)
+    if date_match:
+        d, m, y = date_match.groups()
+        d = d.zfill(2)
+        m = m.zfill(2)
+        return f"{y}-{m}-{d}", f"{d}/{m}/{y}"
+
+    parsed = _parse_data(text)
+    if parsed:
+        return _to_mcp_date(parsed), parsed
+    return None
+
+
+def _parse_sales_shop(text: str) -> tuple[int, str] | None:
+    normalized = _normalize_search_text(text)
+    for name, code in getattr(config, "SHOPS", {}).items():
+        if _normalize_search_text(name) in normalized:
+            return int(code), name.capitalize()
+
+    match = re.search(r"\b(?:botiga|shop|tienda)\s+(\d+)\b", normalized)
+    if not match:
+        match = re.search(r"\b(?:codi|codigo|code)\s+(\d+)\b", normalized)
+    if match:
+        code = int(match.group(1))
+        return code, f"botiga {code}"
+
+    default_code = getattr(config, "SHOP_CODE", None)
+    if default_code:
+        return int(default_code), f"botiga {default_code}"
+    return None
+
+
+def _is_hourly_sales_request(text: str) -> bool:
+    normalized = _normalize_search_text(text)
+    wants_sales = any(word in normalized for word in ("vendes", "ventes", "ventas", "sales"))
+    wants_hours = any(word in normalized for word in ("hora", "hores", "horari", "franja", "franges"))
+    return wants_sales and wants_hours
+
+
+def _format_hourly_sales_report(result: dict, shop_name: str, data_display: str) -> str:
+    hourly: dict[int, dict[str, float | int]] = {}
+    for item in result.get("v", []):
+        hour = item.get("h")
+        if hour is None:
+            continue
+        hour = int(hour)
+        bucket = hourly.setdefault(hour, {"amount": 0.0, "quantity": 0, "lines": 0})
+        bucket["amount"] = float(bucket["amount"]) + float(item.get("i", 0) or 0)
+        bucket["quantity"] = int(bucket["quantity"]) + int(item.get("q", 0) or 0)
+        bucket["lines"] = int(bucket["lines"]) + 1
+
+    total_day = float(result.get("tv", 0) or 0)
+    tickets = int(result.get("nt", 0) or 0)
+    total_hours = round(sum(float(v["amount"]) for v in hourly.values()), 2)
+
+    lines = [
+        f"📊 *Vendes per hores — {shop_name}*",
+        f"📅 {data_display}",
+        f"💰 Total MCP: *{total_day:.2f}€*  |  🧾 Tickets: *{tickets}*",
+        "",
+    ]
+
+    for hour in sorted(hourly):
+        bucket = hourly[hour]
+        lines.append(
+            f"• {hour:02d}:00 — {float(bucket['amount']):.2f}€ "
+            f"({int(bucket['quantity'])} u., {int(bucket['lines'])} línies)"
+        )
+
+    lines.extend(["", f"Σ Hores: *{total_hours:.2f}€*"])
+    diff = round(total_day - total_hours, 2)
+    if abs(diff) >= 0.01:
+        lines.append(f"⚠️ Desquadre: {diff:+.2f}€")
+    else:
+        lines.append("✅ Total per hores quadrat amb el total MCP.")
+    return "\n".join(lines)
+
+
+async def _send_hourly_sales_report(update: Update, text: str) -> bool:
+    if not _is_hourly_sales_request(text):
+        return False
+    if not _is_admin(update):
+        await update.message.reply_text("❌ Aquesta informació només està disponible per a usuaris administratius.")
+        return True
+
+    parsed_date = _parse_sales_date(text)
+    if not parsed_date:
+        await update.message.reply_text("⚠️ Indica la data, per exemple: vendes per hores de Granollers del 16/05/2026.")
+        return True
+
+    parsed_shop = _parse_sales_shop(text)
+    if not parsed_shop:
+        await update.message.reply_text("⚠️ Indica la botiga, per exemple: Granollers o el codi de botiga.")
+        return True
+
+    data_mcp, data_display = parsed_date
+    shop_code, shop_name = parsed_shop
+    estat_msg = await update.message.reply_text(f"📊 Carregant vendes per hores de {shop_name} ({data_display})...")
+    try:
+        result = await mcp.vendes_dia(shop_code, data_mcp)
+        if not result.get("v"):
+            await estat_msg.edit_text(f"ℹ️ Sense dades de vendes per {shop_name} el {data_display}.")
+            return True
+        await estat_msg.delete()
+        await _send_chunks(update.message, _format_hourly_sales_report(result, shop_name, data_display), parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("Error carregant vendes per hores")
+        try:
+            await estat_msg.edit_text("❌")
+        except Exception:
+            pass
+        await update.message.reply_text(f"❌ Error carregant vendes per hores: {exc}")
+    return True
+
+
 async def _print_all_orders(update: Update, data: str) -> None:
     data_mcp = _to_mcp_date(data)
     estat_msg = await update.message.reply_text(f"🖨️ Carregant albarans per imprimir del {data}...")
@@ -951,6 +1073,9 @@ async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "stop":
         context.user_data.clear()
         await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if await _send_hourly_sales_report(update, text):
         return
 
     if _is_print_queue_request(text):
