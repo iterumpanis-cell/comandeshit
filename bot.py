@@ -59,9 +59,10 @@ def _get_copies(client_code: int) -> int:
     AF_CLIENT, AF_CLIENT_OPCIO, AF_DATA, AF_PRODUCTE, AF_PRODUCTE_OPCIO, AF_QUANTITAT, AF_CONFIRMAR,
     VR_CLIENT, VR_CLIENT_OPCIO, VR_DATA,
     EB_CLIENT, EB_CLIENT_OPCIO, EB_DATA, EB_PRODUCTE, EB_PRODUCTE_OPCIO, EB_CONFIRMAR,
+    VD_SHOP, VD_DATE, VD_REPORT,
     IM_DATA, IM_CLIENT, IM_CLIENT_OPCIO, IM_COPIES, IM_SEGUENT,
     IM_TIPUS, IM_TEXT,
-) = range(23)
+) = range(26)
 
 # Instàncies globals
 mcp = MCPVendes()
@@ -367,6 +368,116 @@ def _format_hourly_sales_report(result: dict, shop_name: str, data_display: str)
         lines.append(f"⚠️ Desquadre: {diff:+.2f}€")
     else:
         lines.append("✅ Total per hores quadrat amb el total MCP.")
+    return "\n".join(lines)
+
+
+def _format_sales_summary_report(result: dict, shop_name: str, data_display: str) -> str:
+    total = float(result.get("tv", 0) or 0)
+    tickets = int(result.get("nt", 0) or 0)
+    avg = total / tickets if tickets else 0
+    return "\n".join([
+        f"📊 *Resum vendes — {shop_name}*",
+        f"📅 {data_display}",
+        "",
+        f"💰 Total: *{total:.2f}€*",
+        f"🧾 Tickets: *{tickets}*",
+        f"📈 Ticket mig: *{avg:.2f}€*",
+    ])
+
+
+def _format_product_totals_report(result: dict, shop_name: str, data_display: str) -> str:
+    totals: dict[str, dict[str, float]] = {}
+    for item in result.get("v", []):
+        name = str(item.get("n") or item.get("nm") or "?")
+        bucket = totals.setdefault(name, {"q": 0.0, "i": 0.0})
+        bucket["q"] += float(item.get("q", 0) or 0)
+        bucket["i"] += float(item.get("i", 0) or 0)
+
+    lines = [
+        f"🥖 *Productes total dia — {shop_name}*",
+        f"📅 {data_display}",
+        f"💰 Total: *{float(result.get('tv', 0) or 0):.2f}€*",
+        "",
+    ]
+    for name, values in sorted(totals.items(), key=lambda item: (-item[1]["i"], item[0].lower())):
+        lines.append(f"• {name}: {values['q']:g} u. ({values['i']:.2f}€)")
+    return "\n".join(lines)
+
+
+def _format_products_by_hour_report(result: dict, shop_name: str, data_display: str) -> str:
+    hourly: dict[int, dict[str, dict[str, float]]] = {}
+    for item in result.get("v", []):
+        hour = item.get("h")
+        if hour is None:
+            continue
+        name = str(item.get("n") or item.get("nm") or "?")
+        bucket = hourly.setdefault(int(hour), {}).setdefault(name, {"q": 0.0, "i": 0.0})
+        bucket["q"] += float(item.get("q", 0) or 0)
+        bucket["i"] += float(item.get("i", 0) or 0)
+
+    lines = [
+        f"🕒 *Productes per hora — {shop_name}*",
+        f"📅 {data_display}",
+        f"💰 Total: *{float(result.get('tv', 0) or 0):.2f}€*",
+    ]
+    for hour in sorted(hourly):
+        hour_total = sum(values["i"] for values in hourly[hour].values())
+        lines.append("")
+        lines.append(f"*{hour:02d}:00 — {hour_total:.2f}€*")
+        for name, values in sorted(hourly[hour].items(), key=lambda item: (-item[1]["i"], item[0].lower())):
+            lines.append(f"• {name}: {values['q']:g} u. ({values['i']:.2f}€)")
+    return "\n".join(lines)
+
+
+def _ticket_client_text(ticket: dict) -> str:
+    values = []
+    for key in ("client", "client_name", "customer", "customer_name", "cli", "cn", "ncli", "name"):
+        value = ticket.get(key)
+        if value:
+            values.append(str(value))
+    return " ".join(values)
+
+
+def _format_hora_feliz_report(detail: dict, shop_name: str, data_display: str) -> str:
+    tickets = detail.get("tickets", []) if isinstance(detail, dict) else []
+    matched = [t for t in tickets if "hora feliz" in _normalize_search_text(_ticket_client_text(t))]
+    if not matched:
+        has_client_field = any(_ticket_client_text(t) for t in tickets)
+        if not has_client_field:
+            return (
+                f"🎉 *Hora Feliz — {shop_name}*\n"
+                f"📅 {data_display}\n\n"
+                "❌ El MCP retorna el detall de tiquets amb producte, quantitat, preu i import, "
+                "però no inclou el client del tiquet.\n"
+                "Per fer aquest informe cal que `ticket_detail_day` exposi el client o una eina específica "
+                "per filtrar vendes del client HORA FELIZ."
+            )
+        return f"🎉 *Hora Feliz — {shop_name}*\n📅 {data_display}\n\nℹ️ No he trobat tiquets del client HORA FELIZ."
+
+    totals: dict[str, dict[str, float]] = {}
+    total = 0.0
+    times = []
+    for ticket in matched:
+        if ticket.get("time"):
+            times.append(str(ticket["time"]))
+        total += float(ticket.get("total", 0) or 0)
+        for line in ticket.get("lines", []):
+            name = str(line.get("nm") or line.get("n") or "?")
+            bucket = totals.setdefault(name, {"q": 0.0, "i": 0.0, "p": 0.0})
+            bucket["q"] += float(line.get("q", 0) or 0)
+            bucket["i"] += float(line.get("i", 0) or 0)
+            bucket["p"] = float(line.get("p", 0) or 0)
+
+    lines = [
+        f"🎉 *Hora Feliz — {shop_name}*",
+        f"📅 {data_display}",
+        f"💰 Total: *{total:.2f}€*  |  🧾 Tickets: *{len(matched)}*",
+    ]
+    if times:
+        lines.append(f"🕒 Franja: *{min(times)} - {max(times)}*")
+    lines.append("")
+    for name, values in sorted(totals.items(), key=lambda item: (-item[1]["i"], item[0].lower())):
+        lines.append(f"• {name}: {values['q']:g} u. x {values['p']:.2f}€ = {values['i']:.2f}€")
     return "\n".join(lines)
 
 
@@ -2213,54 +2324,117 @@ async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================================================================== #
 
 async def cmd_vendes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra les vendes agregades del dia via MCP."""
+    """Inicia el flux interactiu d'informes de vendes."""
     if not autoritzat(update):
         await rebuig(update, context)
-        return
+        return ConversationHandler.END
     if not _is_admin(update):
         await update.message.reply_text("❌ Aquesta informació només està disponible per a usuaris administratius.")
-        return
+        return ConversationHandler.END
 
-    args = context.args
-    if args and len(args) >= 2:
-        try:
-            codi = int(args[0])
-            data_str = args[1]  # YYYY-MM-DD
-        except ValueError:
-            await update.message.reply_text("⚠️ Ús: /vendes <codi_botiga> <YYYY-MM-DD>\nEx: /vendes 5 2026-03-31")
-            return
+    context.user_data["vendes"] = {}
+    buttons = [["Granollers", "Montornès"], ["✏️ Codi botiga manual"], ["❌ Cancel·lar"]]
+    await update.message.reply_text(
+        "📊 De quina botiga vols l'informe?",
+        reply_markup=ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return VD_SHOP
+
+
+async def vd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.startswith("❌"):
+        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    normalized = _normalize_search_text(text)
+    if normalized == "granollers":
+        shop_code, shop_name = int(config.SHOPS["granollers"]), "Granollers"
+    elif normalized in {"montornes", "montornès"}:
+        shop_code, shop_name = int(config.SHOPS["montornes"]), "Montornès"
     else:
-        codi = config.SHOP_CODE if hasattr(config, 'SHOP_CODE') else None
-        data_str = date.today().strftime("%Y-%m-%d")
-        if not codi:
-            await update.message.reply_text(
-                "⚠️ Indica el codi de botiga:\n/vendes <codi> <data>\nEx: /vendes 5 2026-03-31"
-            )
-            return
+        match = re.search(r"\d+", text)
+        if not match:
+            await update.message.reply_text("Escriu el codi de botiga o tria una opció.")
+            return VD_SHOP
+        shop_code = int(match.group(0))
+        shop_name = f"Botiga {shop_code}"
 
-    await update.message.reply_text(f"📊 Carregant vendes botiga {codi} ({data_str})...")
+    context.user_data["vendes"] = {"shop_code": shop_code, "shop_name": shop_name}
+    await update.message.reply_text("📅 Tria la data:", reply_markup=_keyboard_dates())
+    return VD_DATE
+
+
+async def vd_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.startswith("❌"):
+        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    parsed = _parse_sales_date(text)
+    if not parsed:
+        await update.message.reply_text("⚠️ Data no vàlida. Escriu-la com dd/mm/aaaa.")
+        return VD_DATE
+
+    data_mcp, data_display = parsed
+    context.user_data.setdefault("vendes", {}).update({"data_mcp": data_mcp, "data_display": data_display})
+    buttons = [
+        ["📊 Resum vendes"],
+        ["🕒 Productes per hora"],
+        ["🥖 Productes total dia"],
+        ["🎉 Hora Feliz"],
+        ["❌ Cancel·lar"],
+    ]
+    await update.message.reply_text(
+        "Quin informe vols?",
+        reply_markup=ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return VD_REPORT
+
+
+async def vd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text.startswith("❌"):
+        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    data = context.user_data.get("vendes", {})
+    shop_code = int(data["shop_code"])
+    shop_name = data["shop_name"]
+    data_mcp = data["data_mcp"]
+    data_display = data["data_display"]
+    normalized = _normalize_search_text(text)
+
+    estat_msg = await update.message.reply_text(
+        f"📊 Carregant informe de {shop_name} ({data_display})...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     try:
-        r = await mcp.vendes_dia(codi, data_str)
+        if "hora feliz" in normalized:
+            detail = await mcp.detall_tickets_dia(shop_code, data_mcp, limit=1000, offset=0)
+            if detail.get("error"):
+                await estat_msg.edit_text(f"❌ Error MCP: {detail['error']}")
+                return ConversationHandler.END
+            report = _format_hora_feliz_report(detail, shop_name, data_display)
+        else:
+            r = await mcp.vendes_dia(shop_code, data_mcp)
+            if not r.get("v"):
+                await estat_msg.edit_text(f"ℹ️ Sense dades de vendes per {shop_name} el {data_display}.")
+                return ConversationHandler.END
+            if "hora" in normalized:
+                report = _format_products_by_hour_report(r, shop_name, data_display)
+            elif "product" in normalized or "total dia" in normalized:
+                report = _format_product_totals_report(r, shop_name, data_display)
+            else:
+                report = _format_sales_summary_report(r, shop_name, data_display)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error MCP: {e}")
-        return
+        logger.exception("Error carregant informe de vendes")
+        await estat_msg.edit_text(f"❌ Error MCP: {e}")
+        return ConversationHandler.END
 
-    tv = r.get("tv", 0)
-    nt = r.get("nt", 0)
-    vendes = r.get("v", [])
-
-    if not vendes:
-        await update.message.reply_text(f"ℹ️ Sense dades de vendes per botiga {codi} el {data_str}.")
-        return
-
-    linies = [f"📊 *Vendes botiga {codi} — {data_str}*", f"💰 Total: *{tv:.2f}€*  |  🧾 Tickets: *{nt}*", ""]
-    for art in vendes[:30]:
-        nom = art.get("n", "?")
-        qty = art.get("q", 0)
-        imp = art.get("i", 0)
-        linies.append(f"• {nom}: {qty} u. ({imp:.2f}€)")
-
-    await update.message.reply_text("\n".join(linies), parse_mode="Markdown")
+    await estat_msg.delete()
+    await _send_chunks(update.message, report, parse_mode="Markdown")
+    return ConversationHandler.END
 
 
 # ================================================================== #
@@ -2769,9 +2943,19 @@ def run_bot():
         fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
     )
 
+    # Flux /vendes
+    vendes_handler = ConversationHandler(
+        entry_points=[CommandHandler("vendes", cmd_vendes)],
+        states={
+            VD_SHOP:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_shop)],
+            VD_DATE:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_date)],
+            VD_REPORT: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_report)],
+        },
+        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_start))
-    app.add_handler(CommandHandler("vendes", cmd_vendes))
     app.add_handler(CommandHandler("imprimir_text", cmd_imprimir_text))
     app.add_handler(CommandHandler("cua_impressio", cmd_cua_impressio))
     app.add_handler(CommandHandler("reset", cmd_reset))
@@ -2779,6 +2963,7 @@ def run_bot():
     app.add_handler(esborrar_handler)
     app.add_handler(veure_handler)
     app.add_handler(imprimir_handler)
+    app.add_handler(vendes_handler)
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact_share))
     app.add_handler(MessageHandler(filters.VOICE, ai_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_text))

@@ -249,15 +249,15 @@ class MCPVendes:
             logger.warning(f"llistar_clients_amb_comanda list_order_clients: {e}, fallback a list_all_clients")
         return await self.llistar_tots_clients()
 
-    async def detall_tickets_dia(self, codi_botiga: int, data: str, limit: int = 1000, offset: int = 0) -> list:
+    async def detall_tickets_dia(self, codi_botiga: int, data: str, limit: int = 1000, offset: int = 0) -> dict:
         """Detall de tiquets de caixa d'una botiga per dia."""
         try:
             args = {"shop_code": codi_botiga, "date": data, "limit": limit, "offset": offset}
             r = await self._tool("ticket_detail_day", args)
-            return r if isinstance(r, list) else []
+            return r if isinstance(r, dict) else {}
         except Exception as e:
             logger.warning(f"detall_tickets_dia: {e}")
-            return []
+            return {"error": str(e)}
 
     async def comandes_per_data(self, data: str, concurrencia: int = 8) -> dict:
         """Retorna totes les comandes de clients per una data.
