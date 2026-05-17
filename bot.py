@@ -440,44 +440,79 @@ def _ticket_client_text(ticket: dict) -> str:
 
 def _format_hora_feliz_report(detail: dict, shop_name: str, data_display: str) -> str:
     tickets = detail.get("tickets", []) if isinstance(detail, dict) else []
-    matched = [t for t in tickets if "hora feliz" in _normalize_search_text(_ticket_client_text(t))]
-    if not matched:
-        has_client_field = any(_ticket_client_text(t) for t in tickets)
-        if not has_client_field:
-            return (
-                f"🎉 *Hora Feliz — {shop_name}*\n"
-                f"📅 {data_display}\n\n"
-                "❌ El MCP retorna el detall de tiquets amb producte, quantitat, preu i import, "
-                "però no inclou el client del tiquet.\n"
-                "Per fer aquest informe cal que `ticket_detail_day` exposi el client o una eina específica "
-                "per filtrar vendes del client HORA FELIZ."
-            )
-        return f"🎉 *Hora Feliz — {shop_name}*\n📅 {data_display}\n\nℹ️ No he trobat tiquets del client HORA FELIZ."
+    regular_prices: dict[int, float] = {}
+    for ticket in tickets:
+        for line in ticket.get("lines", []):
+            article_code = line.get("art")
+            price = float(line.get("p", 0) or 0)
+            if article_code is None or price <= 0:
+                continue
+            article_code = int(article_code)
+            regular_prices[article_code] = max(regular_prices.get(article_code, 0.0), price)
 
     totals: dict[str, dict[str, float]] = {}
-    total = 0.0
+    total_discounted = 0.0
+    total_regular = 0.0
     times = []
-    for ticket in matched:
-        if ticket.get("time"):
-            times.append(str(ticket["time"]))
-        total += float(ticket.get("total", 0) or 0)
+    ticket_ids = set()
+
+    for ticket in tickets:
+        ticket_has_discount = False
         for line in ticket.get("lines", []):
+            article_code = line.get("art")
+            if article_code is None:
+                continue
+            article_code = int(article_code)
+            regular_price = regular_prices.get(article_code, 0.0)
+            price = float(line.get("p", 0) or 0)
+            qty = float(line.get("q", 0) or 0)
+            amount = float(line.get("i", 0) or 0)
+            if regular_price <= 0 or price <= 0 or qty <= 0:
+                continue
+
+            ratio = price / regular_price
+            if not (0.45 <= ratio <= 0.55) or abs(regular_price - price) < 0.05:
+                continue
+
             name = str(line.get("nm") or line.get("n") or "?")
-            bucket = totals.setdefault(name, {"q": 0.0, "i": 0.0, "p": 0.0})
-            bucket["q"] += float(line.get("q", 0) or 0)
-            bucket["i"] += float(line.get("i", 0) or 0)
-            bucket["p"] = float(line.get("p", 0) or 0)
+            if _normalize_search_text(name) == "tallar":
+                continue
+            regular_amount = regular_price * qty
+            bucket = totals.setdefault(name, {"q": 0.0, "i": 0.0, "regular": 0.0, "p": price, "regular_p": regular_price})
+            bucket["q"] += qty
+            bucket["i"] += amount
+            bucket["regular"] += regular_amount
+            bucket["p"] = price
+            bucket["regular_p"] = regular_price
+            total_discounted += amount
+            total_regular += regular_amount
+            ticket_has_discount = True
+
+        if ticket_has_discount:
+            ticket_ids.add(ticket.get("tick"))
+            if ticket.get("time"):
+                times.append(str(ticket["time"]))
+
+    if not totals:
+        return f"🎉 *Hora Feliz — {shop_name}*\n📅 {data_display}\n\nℹ️ No he trobat línies amb preu aproximadament al 50%."
 
     lines = [
         f"🎉 *Hora Feliz — {shop_name}*",
         f"📅 {data_display}",
-        f"💰 Total: *{total:.2f}€*  |  🧾 Tickets: *{len(matched)}*",
+        f"💰 Venut 50%: *{total_discounted:.2f}€*  |  🧾 Tickets: *{len(ticket_ids)}*",
+        f"🏷️ Preu habitual estimat: *{total_regular:.2f}€*",
+        f"📉 Descompte estimat: *{(total_regular - total_discounted):.2f}€*",
     ]
     if times:
         lines.append(f"🕒 Franja: *{min(times)} - {max(times)}*")
     lines.append("")
     for name, values in sorted(totals.items(), key=lambda item: (-item[1]["i"], item[0].lower())):
-        lines.append(f"• {name}: {values['q']:g} u. x {values['p']:.2f}€ = {values['i']:.2f}€")
+        discount = values["regular"] - values["i"]
+        lines.append(
+            f"• {name}: {values['q']:g} u. x {values['p']:.2f}€ "
+            f"(habitual {values['regular_p']:.2f}€) = {values['i']:.2f}€ "
+            f"[-{discount:.2f}€]"
+        )
     return "\n".join(lines)
 
 
