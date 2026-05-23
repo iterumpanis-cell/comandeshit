@@ -2832,6 +2832,72 @@ async def _notify_auto_all_users(bot: Bot, text: str):
             logger.warning("No s'ha pogut notificar l'usuari %s: %s", uid, e)
 
 
+def _auto_envia_state_path(data_mcp: str) -> Path:
+    return AUTO_ENVIA_STATE_DIR / f"{data_mcp}.json"
+
+
+def _read_auto_envia_state(data_mcp: str) -> dict | None:
+    path = _auto_envia_state_path(data_mcp)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Auto enviament: no puc llegir estat %s: %s", path, exc)
+        return {"status": "unknown", "path": str(path)}
+
+
+def _write_auto_envia_state(data_mcp: str, state: dict) -> None:
+    AUTO_ENVIA_STATE_DIR.mkdir(exist_ok=True)
+    path = _auto_envia_state_path(data_mcp)
+    payload = {**state, "date": data_mcp, "updated_at": datetime.now().isoformat(timespec="seconds")}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _claim_auto_envia_run(data_mcp: str) -> bool:
+    AUTO_ENVIA_STATE_DIR.mkdir(exist_ok=True)
+    path = _auto_envia_state_path(data_mcp)
+    now = datetime.now()
+    payload = {
+        "date": data_mcp,
+        "status": "running",
+        "started_at": now.isoformat(timespec="seconds"),
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+    try:
+        with path.open("x", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        return True
+    except FileExistsError:
+        state = _read_auto_envia_state(data_mcp) or {}
+        status = state.get("status")
+        if status == "success":
+            logger.info("Auto enviament: %s ja consta enviat correctament, saltant", data_mcp)
+            return False
+        if status == "running":
+            started_raw = state.get("started_at") or state.get("updated_at")
+            try:
+                started = datetime.fromisoformat(started_raw) if started_raw else now
+            except ValueError:
+                started = now
+            if now - started < timedelta(hours=2):
+                logger.warning("Auto enviament: %s ja s'està executant, saltant duplicat", data_mcp)
+                return False
+            logger.warning("Auto enviament: estat running antic per %s, reintentant", data_mcp)
+        else:
+            logger.info("Auto enviament: estat anterior %s per %s, reintentant", status, data_mcp)
+        _write_auto_envia_state(data_mcp, payload)
+        return True
+
+
+def _mark_auto_envia_success(data_mcp: str, *, clients: int, copies: int) -> None:
+    _write_auto_envia_state(data_mcp, {"status": "success", "clients": clients, "copies": copies})
+
+
+def _mark_auto_envia_failed(data_mcp: str, error: str) -> None:
+    _write_auto_envia_state(data_mcp, {"status": "failed", "error": error})
+
+
 async def auto_envia_comandes():
     """Executa una passada d'autoenviament per ser cridada des d'un cron extern."""
     async with Bot(token=config.TELEGRAM_TOKEN) as bot:
@@ -2845,10 +2911,14 @@ async def _run_auto_envia_comandes(bot: Bot):
 
     logger.info("Auto enviament: iniciant per al %s", data_display)
 
+    if not _claim_auto_envia_run(data_mcp):
+        return
+
     try:
         resultat = await mcp.comandes_per_data(data_mcp)
     except Exception as e:
         logger.exception("Auto enviament: error MCP per al %s", data_display)
+        _mark_auto_envia_failed(data_mcp, str(e))
         await _notify_auto_all_users(bot, f"❌ Error auto enviament del {escape(data_display)}: {escape(str(e))}")
         return
 
@@ -2856,6 +2926,7 @@ async def _run_auto_envia_comandes(bot: Bot):
     if not clients:
         msg = f"ℹ️ Auto enviament: no hi ha comandes per al {escape(data_display)}."
         logger.info(msg)
+        _mark_auto_envia_success(data_mcp, clients=0, copies=0)
         await _notify_auto_all_users(bot, msg)
         return
 
@@ -2920,6 +2991,10 @@ async def _run_auto_envia_comandes(bot: Bot):
         )
 
     logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
+    if errors:
+        _mark_auto_envia_failed(data_mcp, "; ".join(errors[:10]))
+    else:
+        _mark_auto_envia_success(data_mcp, clients=len(impresos), copies=total_copies)
     await _notify_auto_all_users(bot, summary)
 
     if totals_lines:
