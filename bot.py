@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 PERSISTENCE_PATH = Path(__file__).with_name("bot_state.pkl")
 AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
 CLIENT_COPIES_PATH = Path(__file__).with_name("client_copies.json")
+AUTO_ENVIA_STATE_DIR = Path(__file__).with_name("auto_envia_state")
 
 
 def _get_copies(client_code: int) -> int:
