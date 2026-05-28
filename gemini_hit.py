@@ -99,6 +99,9 @@ class GeminiHitAssistant:
             "Usa print_delivery_notes NOMES quan l'usuari demana explicitament IMPRIMIR. "
             "Per accions que modifiquen dades, com add_order o print_delivery_notes, nomes les has d'executar si la intencio "
             "de l'usuari es explicita i tens tots els parametres necessaris. Si falta alguna dada, pregunta-la de forma concreta. "
+            "Quan l'usuari demani canviar una comanda/albara, add_order nomes prepara la proposta: el bot preguntara despres "
+            "si la quantitat s'ha d'aplicar a demanat, servit i/o tornat amb botons. Si l'usuari diu explicitament demanat, "
+            "servit o tornat, igualment continua amb add_order i el bot ho confirmara amb botons abans d'escriure. "
             "Si l'usuari et saluda o et fa una pregunta general, pots respondre sense eines. "
             "Quan mostris un albara o una comanda, usa el format curt de Telegram del bot: "
             "primera linia amb el client i la data, linies separades amb una entrada per producte, "
@@ -285,6 +288,11 @@ class GeminiHitAssistant:
                         "quantity": {
                             "type": "integer",
                             "description": "Quantitat a demanar. Pot ser 0 per deixar-la a zero.",
+                        },
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["requested", "served", "returned"]},
+                            "description": "Camps indicats explicitament per l'usuari: requested=demanat, served=servit, returned=tornat. Si no ho diu, ometre.",
                         },
                         "order_type": {
                             "type": "integer",
@@ -838,9 +846,18 @@ class GeminiHitAssistant:
             "selection_type": selection_type,
         }
 
-    async def execute_order(self, date: str, client: int, article_code: int, quantity: int, order_type: int = 1) -> dict:
+    async def execute_order(self, date: str, client: int, article_code: int, quantity: int,
+                            fields=None, order_type: int = 1) -> dict:
         """Executa directament una comanda (usat per bot.py després de confirmació)."""
-        return await self.mcp.afegir_linia_mcp(date, client, article_code, quantity, order_type)
+        fields = set(fields or {"requested", "served"})
+        kwargs = {}
+        if "requested" in fields:
+            kwargs["requested_quantity"] = quantity
+        if "served" in fields:
+            kwargs["served_quantity"] = quantity
+        if "returned" in fields:
+            kwargs["returned_quantity"] = quantity
+        return await self.mcp.canviar_linia_mcp(date, client, article_code, order_type, **kwargs)
 
     async def _add_order(
         self,
@@ -848,6 +865,7 @@ class GeminiHitAssistant:
         client: int,
         article_code: int,
         quantity: int,
+        fields: list | None = None,
         order_type: int = 1,
         client_name: str = "?",
         article_name: str = "?",
@@ -864,6 +882,7 @@ class GeminiHitAssistant:
             "article_code": article_code,
             "article_name": article_name,
             "quantity": quantity,
+            "fields": fields or [],
             "order_type": order_type,
         }
 

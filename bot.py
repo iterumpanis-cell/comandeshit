@@ -4,8 +4,11 @@ Tot via MCP: cerca clients, cerca articles, afegir (normal i encarrec), veure co
 """
 import asyncio
 import argparse
+import atexit
 import json
 import logging
+import msvcrt
+import os
 import re
 import tempfile
 import unicodedata
@@ -43,6 +46,61 @@ PERSISTENCE_PATH = Path(__file__).with_name("bot_state.pkl")
 AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
 CLIENT_COPIES_PATH = Path(__file__).with_name("client_copies.json")
 AUTO_ENVIA_STATE_DIR = Path(__file__).with_name("auto_envia_state")
+BOT_LOG_PATH = Path(__file__).with_name("bot_log.txt")
+BOT_LOCK_PATH = Path(__file__).with_name("bot.lock")
+_BOT_LOCK_FILE = None
+
+
+def _setup_file_logging() -> None:
+    root = logging.getLogger()
+    log_path = str(BOT_LOG_PATH.resolve())
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", None) == log_path:
+            return
+    handler = logging.FileHandler(BOT_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(handler)
+
+
+def _release_single_instance_lock() -> None:
+    global _BOT_LOCK_FILE
+    if not _BOT_LOCK_FILE:
+        return
+    try:
+        _BOT_LOCK_FILE.seek(0)
+        msvcrt.locking(_BOT_LOCK_FILE.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        _BOT_LOCK_FILE.close()
+    except Exception:
+        pass
+    _BOT_LOCK_FILE = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    global _BOT_LOCK_FILE
+    BOT_LOCK_PATH.touch(exist_ok=True)
+    lock_file = BOT_LOCK_PATH.open("r+", encoding="utf-8")
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+        return False
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    _BOT_LOCK_FILE = lock_file
+    atexit.register(_release_single_instance_lock)
+    return True
+
+
+_setup_file_logging()
 
 
 def _get_copies(client_code: int) -> int:
@@ -122,6 +180,98 @@ def _keyboard_sales_dates() -> ReplyKeyboardMarkup:
         buttons.append(row)
     buttons.append(["✏️ Data lliure (dd/mm/aaaa)"])
     return ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True)
+
+
+ORDER_FIELD_LABELS = {
+    "requested": "Demanat",
+    "served": "Servit",
+    "returned": "Tornat",
+}
+
+ORDER_FIELD_KWARGS = {
+    "requested": "requested_quantity",
+    "served": "served_quantity",
+    "returned": "returned_quantity",
+}
+
+
+def _format_order_fields(fields) -> str:
+    return " + ".join(ORDER_FIELD_LABELS[f] for f in ORDER_FIELD_LABELS if f in fields) or "cap"
+
+
+def _order_field_buttons(selected, prefix: str) -> list[list[InlineKeyboardButton]]:
+    return [[
+        InlineKeyboardButton(
+            f"{'✅' if field in selected else '☐'} {label}",
+            callback_data=f"{prefix}_field:{field}",
+        )
+        for field, label in ORDER_FIELD_LABELS.items()
+    ]]
+
+
+def _manual_order_text(pending: dict) -> str:
+    action = "posar a 0" if pending.get("quantity") == 0 else f"posar a {pending.get('quantity')}"
+    return (
+        f"*Quins camps vols canviar?*\n\n"
+        f"👤 Client: *{pending.get('client_name')}*\n"
+        f"📅 Data: *{pending.get('date_display')}*\n"
+        f"🥖 Producte: *{pending.get('article_name')}*\n"
+        f"🔢 Acció: *{action}*\n"
+        f"📌 Camps: *{_format_order_fields(pending.get('fields', set()))}*"
+    )
+
+
+def _manual_order_keyboard(pending: dict) -> InlineKeyboardMarkup:
+    rows = _order_field_buttons(pending.get("fields", set()), "order")
+    if pending.get("mode") == "delete":
+        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:1")])
+    else:
+        rows.append([
+            InlineKeyboardButton("✅ Afegir", callback_data="order_apply:1"),
+            InlineKeyboardButton("📦 Encarreg", callback_data="order_apply:2"),
+        ])
+    rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _confirmation_text(lines: list, fields) -> str:
+    text_lines = ["📋 *Confirmes la comanda?*\n"]
+    for line in lines:
+        date_fmt = line.get("date", "?")
+        client_name = line.get("client_name", f"codi {line.get('client', '?')}")
+        article_name = line.get("article_name", f"codi {line.get('article_code', '?')}")
+        qty = line.get("quantity", 0)
+        order_type = line.get("order_type", 1)
+        prefix = "🎗️ " if order_type == 2 else "🥖 "
+        text_lines.append(f"{prefix}*{article_name}* × {qty}")
+        text_lines.append(f"   👤 {client_name}  📅 {date_fmt}")
+    text_lines.append(f"\n📌 Camps: *{_format_order_fields(fields)}*")
+    return "\n".join(text_lines)
+
+
+def _confirmation_keyboard(fields, choose_order_type: bool = False) -> InlineKeyboardMarkup:
+    rows = _order_field_buttons(fields, "confirm")
+    if choose_order_type:
+        rows.append([
+            InlineKeyboardButton("✅ Afegir", callback_data="confirm_yes:1"),
+            InlineKeyboardButton("📦 Encarreg", callback_data="confirm_yes:2"),
+        ])
+        rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="confirm_no")])
+    else:
+        rows.append([
+            InlineKeyboardButton("✅ Confirmar", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ Cancel·lar", callback_data="confirm_no"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _initial_confirmation_fields(lines: list) -> set:
+    explicit = set()
+    for line in lines:
+        for field in line.get("fields", []) or []:
+            if field in ORDER_FIELD_LABELS:
+                explicit.add(field)
+    return explicit or {"requested", "served"}
 
 
 def _parse_data(text: str) -> str | None:
@@ -1182,31 +1332,18 @@ async def _handle_ai_answer(update, context, answer, estat_msg, transcript=None)
                 )
                 return
 
+        fields = _initial_confirmation_fields(lines)
         context.user_data["pending_confirmation"] = {
             "lines": lines,
             "contents": contents,
+            "fields": fields,
+            "choose_order_type": True,
         }
 
-        # Construïm el text de confirmació
-        text_lines = ["📋 *Confirmes la comanda?*\n"]
-        for line in lines:
-            date_fmt = line.get("date", "?")
-            client_name = line.get("client_name", f"codi {line.get('client', '?')}")
-            article_name = line.get("article_name", f"codi {line.get('article_code', '?')}")
-            qty = line.get("quantity", 0)
-            order_type = line.get("order_type", 1)
-            prefix = "🎗️ " if order_type == 2 else "🥖 "
-            text_lines.append(f"{prefix}*{article_name}* × {qty}")
-            text_lines.append(f"   👤 {client_name}  📅 {date_fmt}\n")
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Confirmar", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ Cancel·lar", callback_data="confirm_no"),
-        ]])
         await update.message.reply_text(
-            "\n".join(text_lines),
+            _confirmation_text(lines, fields),
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=_confirmation_keyboard(fields, choose_order_type=True),
         )
         return
 
@@ -1394,6 +1531,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             selected_idx,
             len(options),
         )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ La selecció ja no és vàlida. Torna a enviar la petició, si us plau.",
+        )
         return
 
     selected = options[selected_idx]
@@ -1478,30 +1619,33 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # La IA vol confirmar una comanda
         lines = answer.get("lines", [])
         new_contents = answer.get("__gemini_contents__", [])
-        context.user_data["pending_confirmation"] = {"lines": lines, "contents": new_contents}
-
-        text_lines = ["📋 *Confirmes la comanda?*\n"]
-        for line in lines:
-            client_name = line.get("client_name", f"codi {line.get('client', '?')}")
-            article_name = line.get("article_name", f"codi {line.get('article_code', '?')}")
-            qty = line.get("quantity", 0)
-            order_type = line.get("order_type", 1)
-            prefix = "🎗️ " if order_type == 2 else "🥖 "
-            text_lines.append(f"{prefix}*{article_name}* × {qty}")
-            text_lines.append(f"   👤 {client_name}  📅 {line.get('date', '?')}\n")
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Confirmar", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ Cancel·lar", callback_data="confirm_no"),
-        ]])
+        fields = _initial_confirmation_fields(lines)
+        context.user_data["pending_confirmation"] = {
+            "lines": lines,
+            "contents": new_contents,
+            "fields": fields,
+            "choose_order_type": True,
+        }
         await context.bot.send_message(
             chat_id=chat_id,
-            text="\n".join(text_lines),
+            text=_confirmation_text(lines, fields),
             parse_mode="Markdown",
-            reply_markup=keyboard,
+            reply_markup=_confirmation_keyboard(fields, choose_order_type=True),
         )
     else:
         logger.warning(f"handle_poll_answer: resposta inesperada tipus {type(answer)}: {str(answer)[:200]}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ No he pogut continuar després de la selecció. Torna a enviar la petició, si us plau.",
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    if error:
+        logger.error("Error no gestionat al bot", exc_info=(type(error), error, error.__traceback__))
+    else:
+        logger.error("Error no gestionat al bot sense excepcio associada. update=%s", update)
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1509,6 +1653,108 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data.startswith("order_field:"):
+        pending = context.user_data.get("pending_order_edit")
+        if not pending:
+            await query.edit_message_text("❌ No hi ha cap canvi pendent.")
+            return
+        field = data.split(":", 1)[1]
+        fields = set(pending.get("fields", set()))
+        if field in fields:
+            fields.remove(field)
+        elif field in ORDER_FIELD_LABELS:
+            fields.add(field)
+        pending["fields"] = fields
+        logger.info(
+            "order_field toggle user=%s field=%s fields=%s pending=%s",
+            query.from_user.id,
+            field,
+            sorted(fields),
+            {k: pending.get(k) for k in ("mode", "client_code", "date_mcp", "article_code", "quantity")},
+        )
+        await query.edit_message_text(
+            _manual_order_text(pending),
+            parse_mode="Markdown",
+            reply_markup=_manual_order_keyboard(pending),
+        )
+        return
+
+    if data == "order_cancel":
+        context.user_data.pop("pending_order_edit", None)
+        await query.edit_message_text("❌ Canvi cancel·lat.")
+        return
+
+    if data.startswith("order_apply:"):
+        pending = context.user_data.pop("pending_order_edit", None)
+        if not pending:
+            await query.edit_message_text("❌ No hi ha cap canvi pendent.")
+            return
+        fields = set(pending.get("fields", set()))
+        if not fields:
+            context.user_data["pending_order_edit"] = pending
+            await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
+            return
+        order_type = int(data.split(":", 1)[1])
+        quantity = int(pending.get("quantity", 0))
+        kwargs = {ORDER_FIELD_KWARGS[f]: quantity for f in fields}
+        logger.info(
+            "order_apply user=%s order_type=%s fields=%s kwargs=%s pending=%s",
+            query.from_user.id,
+            order_type,
+            sorted(fields),
+            kwargs,
+            {k: pending.get(k) for k in ("mode", "client_code", "date_mcp", "article_code", "quantity")},
+        )
+        await query.edit_message_text("⏳ Aplicant canvi...")
+        result = await mcp.canviar_linia_mcp(
+            pending["date_mcp"],
+            pending["client_code"],
+            pending["article_code"],
+            order_type,
+            **kwargs,
+        )
+        if result.get("ok"):
+            action = "posat a 0" if quantity == 0 else f"posat a {quantity}"
+            await query.message.reply_text(
+                f"✅ Canvi aplicat correctament.\n\n"
+                f"👤 {pending['client_name']}\n"
+                f"📅 {pending['date_display']}\n"
+                f"🥖 {pending['article_name']}\n"
+                f"📌 {_format_order_fields(fields)}: {action}"
+            )
+        else:
+            await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
+        return
+
+    if data.startswith("confirm_field:"):
+        pending = context.user_data.get("pending_confirmation")
+        if not pending:
+            await query.edit_message_text("❌ No hi ha cap comanda pendent.")
+            return
+        field = data.split(":", 1)[1]
+        fields = set(pending.get("fields", {"requested", "served"}))
+        if field in fields:
+            fields.remove(field)
+        elif field in ORDER_FIELD_LABELS:
+            fields.add(field)
+        pending["fields"] = fields
+        logger.info(
+            "confirm_field toggle user=%s field=%s fields=%s lines=%s",
+            query.from_user.id,
+            field,
+            sorted(fields),
+            [
+                {k: line.get(k) for k in ("date", "client", "article_code", "quantity", "order_type")}
+                for line in pending.get("lines", [])
+            ],
+        )
+        await query.edit_message_text(
+            _confirmation_text(pending.get("lines", []), fields),
+            parse_mode="Markdown",
+            reply_markup=_confirmation_keyboard(fields, choose_order_type=pending.get("choose_order_type", False)),
+        )
+        return
 
     if data.startswith("auth_client:") or data.startswith("auth_admin:") or data.startswith("auth_deny:"):
         admin_id = _get_admin_user_id()
@@ -1575,11 +1821,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Comanda cancel·lada.")
         return
 
-    if data == "confirm_yes":
+    if data.startswith("confirm_yes"):
         pending = context.user_data.pop("pending_confirmation", None)
         if not pending:
             await query.edit_message_text("❌ No hi ha cap comanda pendent.")
             return
+        fields = set(pending.get("fields", {"requested", "served"}))
+        if not fields:
+            context.user_data["pending_confirmation"] = pending
+            await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
+            return
+        forced_order_type = None
+        if ":" in data:
+            try:
+                forced_order_type = int(data.split(":", 1)[1])
+            except ValueError:
+                forced_order_type = None
 
         try:
             await query.message.delete()
@@ -1592,13 +1849,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         for line in lines:
             try:
+                order_type = forced_order_type if forced_order_type in (1, 2) else line.get("order_type", 1)
+                logger.info(
+                    "confirm_apply user=%s order_type=%s fields=%s line=%s",
+                    query.from_user.id,
+                    order_type,
+                    sorted(fields),
+                    {k: line.get(k) for k in ("date", "client", "article_code", "quantity", "order_type")},
+                )
                 result = await ai.execute_order(
                     date=line["date"],
                     client=line["client"],
                     article_code=line["article_code"],
                     quantity=line["quantity"],
-                    order_type=line.get("order_type", 1),
+                    fields=fields,
+                    order_type=order_type,
                 )
+                if forced_order_type in (1, 2):
+                    line["order_type"] = forced_order_type
                 if result.get("ok"):
                     results.append(line)
                 else:
@@ -1895,17 +2163,30 @@ async def af_quantitat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["quantitat"] = q
     d = context.user_data
 
-    keyboard = [["✅ Afegir", "📦 Encarreg"], ["❌ Cancel·lar"]]
-    await update.message.reply_text(
-        f"*Confirmes?*\n\n"
-        f"👤 Client:    *{d['client']}*\n"
-        f"📅 Data:      *{d['data']}*\n"
-        f"🥖 Producte:  *{d['producte']}*\n"
-        f"🔢 Quantitat: *{q}*",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    pending = {
+        "mode": "add",
+        "client_name": d["client"],
+        "client_code": d["client_code"],
+        "date_display": d["data"],
+        "date_mcp": _to_mcp_date(d["data"]),
+        "article_name": d["producte"],
+        "article_code": d["article_code"],
+        "quantity": q,
+        "fields": {"requested", "served"},
+    }
+    context.user_data["pending_order_edit"] = pending
+    logger.info(
+        "manual_order_prompt mode=add user=%s pending=%s fields=%s",
+        update.effective_user.id if update.effective_user else None,
+        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
+        sorted(pending["fields"]),
     )
-    return AF_CONFIRMAR
+    await update.message.reply_text(
+        _manual_order_text(pending),
+        parse_mode="Markdown",
+        reply_markup=_manual_order_keyboard(pending),
+    )
+    return ConversationHandler.END
 
 
 async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2319,16 +2600,30 @@ async def eb_producte_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _confirmar_esborrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
-    keyboard = [["🗑️ Sí, esborra", "❌ Cancel·lar"]]
-    await update.message.reply_text(
-        f"⚠️ *Confirmes que vols esborrar?*\n\n"
-        f"👤 Client:   *{d['client']}*\n"
-        f"📅 Data:     *{d['data']}*\n"
-        f"🥖 Producte: *{d['producte']}*",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    pending = {
+        "mode": "delete",
+        "client_name": d["client"],
+        "client_code": d["client_code"],
+        "date_display": d["data"],
+        "date_mcp": _to_mcp_date(d["data"]),
+        "article_name": d["producte"],
+        "article_code": d["article_code"],
+        "quantity": 0,
+        "fields": {"requested", "served", "returned"},
+    }
+    context.user_data["pending_order_edit"] = pending
+    logger.info(
+        "manual_order_prompt mode=delete user=%s pending=%s fields=%s",
+        update.effective_user.id if update.effective_user else None,
+        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
+        sorted(pending["fields"]),
     )
-    return EB_CONFIRMAR
+    await update.message.reply_text(
+        _manual_order_text(pending),
+        parse_mode="Markdown",
+        reply_markup=_manual_order_keyboard(pending),
+    )
+    return ConversationHandler.END
 
 
 async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3009,6 +3304,10 @@ async def _run_auto_envia_comandes(bot: Bot):
 # ------------------------------------------------------------------ #
 
 def run_bot():
+    if not _acquire_single_instance_lock():
+        logger.error("No s'arrenca el bot: ja hi ha una altra instancia activa (lock: %s)", BOT_LOCK_PATH)
+        return
+
     persistence = PicklePersistence(filepath=str(PERSISTENCE_PATH))
     app = (
         Application.builder()
@@ -3107,6 +3406,7 @@ def run_bot():
     from telegram.ext import PollAnswerHandler, CallbackQueryHandler as TGCallbackQueryHandler
     app.add_handler(TGCallbackQueryHandler(handle_callback_query))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
+    app.add_error_handler(error_handler)
 
     logger.info("=" * 50)
     logger.info("  Bot HitSystems actiu. Ctrl+C per aturar.")

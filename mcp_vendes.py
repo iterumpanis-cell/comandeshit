@@ -214,23 +214,56 @@ class MCPVendes:
             logger.warning(f"cua_impressio: {e}")
             return {"error": str(e)}
 
-    async def afegir_linia_mcp(self, data: str, client: int, article_code: int,
-                                quantity: int, order_type: int = 1) -> dict:
-        """Afegir línia de comanda via MCP.
+    async def _valors_linia_actuals(self, data: str, client: int, article_code: int, order_type: int) -> dict:
+        """Retorna les quantitats actuals d'una linia, o zeros si encara no existeix."""
+        r = await self.veure_comanda(data, client)
+        for line in r.get("order", []):
+            if int(line.get("art", -1)) == int(article_code) and int(line.get("order_type", order_type)) == int(order_type):
+                return {
+                    "requested_quantity": int(line.get("requested", 0) or 0),
+                    "served_quantity": int(line.get("served", 0) or 0),
+                    "returned_quantity": int(line.get("returned", 0) or 0),
+                }
+        return {"requested_quantity": 0, "served_quantity": 0, "returned_quantity": 0}
+
+    async def canviar_linia_mcp(self, data: str, client: int, article_code: int,
+                                order_type: int = 1,
+                                requested_quantity: int | None = None,
+                                served_quantity: int | None = None,
+                                returned_quantity: int | None = None) -> dict:
+        """Canvia una linia preservant els camps que no s'han indicat.
         order_type: 1=normal (default), 2=encarrec
         """
         try:
+            current = await self._valors_linia_actuals(data, client, article_code, order_type)
+            if requested_quantity is not None:
+                current["requested_quantity"] = requested_quantity
+            if served_quantity is not None:
+                current["served_quantity"] = served_quantity
+            if returned_quantity is not None:
+                current["returned_quantity"] = returned_quantity
             args = {
                 "date": data,
                 "client": client,
                 "article_code": article_code,
-                "quantity": quantity,
+                "requested_quantity": current["requested_quantity"],
+                "served_quantity": current["served_quantity"],
+                "returned_quantity": current["returned_quantity"],
                 "order_type": order_type,
             }
             return await self._tool("add_order", args)
         except Exception as e:
-            logger.warning(f"afegir_linia_mcp: {e}")
+            logger.warning(f"canviar_linia_mcp: {e}")
             return {"error": str(e)}
+
+    async def afegir_linia_mcp(self, data: str, client: int, article_code: int,
+                                quantity: int, order_type: int = 1) -> dict:
+        """Compatibilitat: aplica la quantitat a demanat i servit."""
+        return await self.canviar_linia_mcp(
+            data, client, article_code, order_type,
+            requested_quantity=quantity,
+            served_quantity=quantity,
+        )
 
     async def llistar_clients_amb_comanda(self, data: str) -> list:
         """Retorna llista de clients que tenen comanda en una data.

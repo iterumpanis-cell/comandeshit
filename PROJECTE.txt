@@ -1,0 +1,8 @@
+Projecte: COMANDES HIT
+
+Memoria operativa:
+- Els canvis de comanda/albara han de demanar sempre si la quantitat afecta Demanat, Servit i/o Tornat.
+- Es pot seleccionar mes d'un camp alhora, especialment Demanat + Servit.
+- Les confirmacions han de permetre triar Afegir (normal) o Encarreg abans d'escriure al MCP.
+- L'usuari 911219941 no ha de rebre reports automatics ni estar autoritzat.
+- Els reports automatics d'albarans s'envien nomes als chat_id autoritzats restants: 763451515 i 5269048043.

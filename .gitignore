@@ -4,6 +4,7 @@ __pycache__/
 bot.log
 bot_log.txt
 bot_state.pkl
+bot.lock
 authorized_users.json
 auto_envia_state/
 .claude/
