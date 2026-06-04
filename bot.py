@@ -3196,8 +3196,19 @@ def _mark_auto_envia_failed(data_mcp: str, error: str) -> None:
 
 async def auto_envia_comandes():
     """Executa una passada d'autoenviament per ser cridada des d'un cron extern."""
+    if not _auto_envia_dins_finestra_cron():
+        logger.warning("Auto enviament: execucio fora de finestra cron, saltant")
+        return
     async with Bot(token=config.TELEGRAM_TOKEN) as bot:
         await _run_auto_envia_comandes(bot)
+
+
+def _auto_envia_dins_finestra_cron(now: datetime | None = None) -> bool:
+    """Evita que PM2 executi l'enviament nomes per arrencar o resurrectar l'app."""
+    now = now or datetime.now()
+    if now.weekday() < 5:
+        return now.hour == 18 and now.minute <= 10
+    return now.hour == 13 and now.minute <= 10
 
 
 async def _run_auto_envia_comandes(bot: Bot):
