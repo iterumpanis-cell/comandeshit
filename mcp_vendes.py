@@ -5,12 +5,16 @@ Protocol: MCP Streamable HTTP amb sessions (mcp-session-id header)
 import asyncio
 import json
 import logging
+import os
 import time
 import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-MCP_URL = "https://octomes.com/mcp/ded3a2f73f433c5fa4ab3edf03cbe661e0953614a646094ff32497c3c482af9f"
+MCP_URL = os.getenv("MCP_URL", "").strip()
 
 
 def _parse_sse(text: str) -> dict | None:
@@ -39,6 +43,8 @@ class MCPVendes:
 
     async def _call(self, method: str, params: dict) -> dict:
         """Crida al servidor MCP. Si el certificat SSL ha caducat, desactiva la verificació automàticament."""
+        if not MCP_URL:
+            raise RuntimeError("Falta configurar MCP_URL al fitxer .env")
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -226,13 +232,29 @@ class MCPVendes:
                 }
         return {"requested_quantity": 0, "served_quantity": 0, "returned_quantity": 0}
 
+    async def linies_article_comanda(self, data: str, client: int, article_code: int) -> list[dict]:
+        """Retorna les linies existents d'un article en una comanda, amb el seu order_type real."""
+        r = await self.veure_comanda(data, client)
+        linies = []
+        for line in r.get("order", []):
+            if int(line.get("art", -1)) != int(article_code):
+                continue
+            linies.append({
+                "order_type": int(line.get("order_type", 1) or 1),
+                "order_type_name": line.get("order_type_name") or str(line.get("order_type", 1) or 1),
+                "requested": int(line.get("requested", 0) or 0),
+                "served": int(line.get("served", 0) or 0),
+                "returned": int(line.get("returned", 0) or 0),
+            })
+        return linies
+
     async def canviar_linia_mcp(self, data: str, client: int, article_code: int,
                                 order_type: int = 1,
                                 requested_quantity: int | None = None,
                                 served_quantity: int | None = None,
                                 returned_quantity: int | None = None) -> dict:
         """Canvia una linia preservant els camps que no s'han indicat.
-        order_type: 1=normal (default), 2=encarrec
+        order_type: tipus real de la linia MCP. 1=normal, 2=encarrec; altres valors poden existir.
         """
         try:
             current = await self._valors_linia_actuals(data, client, article_code, order_type)
@@ -280,7 +302,11 @@ class MCPVendes:
             logger.info("llistar_clients_amb_comanda: list_order_clients buit, fallback a list_all_clients")
         except Exception as e:
             logger.warning(f"llistar_clients_amb_comanda list_order_clients: {e}, fallback a list_all_clients")
-        return await self.llistar_tots_clients()
+        try:
+            r = await self._tool("list_all_clients", {})
+            return r if isinstance(r, list) else []
+        except Exception as e:
+            raise RuntimeError(f"No s'han pogut consultar clients amb comanda per {data}: {e}") from e
 
     async def detall_tickets_dia(self, codi_botiga: int, data: str, limit: int = 1000, offset: int = 0) -> dict:
         """Detall de tiquets de caixa d'una botiga per dia."""

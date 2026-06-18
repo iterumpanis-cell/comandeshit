@@ -31,6 +31,7 @@ from telegram.ext import (
 
 import config
 from gemini_hit import GeminiHitAssistant, NEEDS_SELECTION, NEEDS_CONFIRMATION
+import mcp_vendes as mcp_module
 from mcp_vendes import MCPVendes
 from printer import _format_totals_escpos, imprimir_text_directe
 
@@ -41,6 +42,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 PERSISTENCE_PATH = Path(__file__).with_name("bot_state.pkl")
 AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
@@ -49,6 +52,7 @@ AUTO_ENVIA_STATE_DIR = Path(__file__).with_name("auto_envia_state")
 BOT_LOG_PATH = Path(__file__).with_name("bot_log.txt")
 BOT_LOCK_PATH = Path(__file__).with_name("bot.lock")
 _BOT_LOCK_FILE = None
+MCP_TOKEN_RE = re.compile(r"/mcp/([^/?#\s]+)")
 
 
 def _setup_file_logging() -> None:
@@ -143,6 +147,65 @@ def _to_mcp_date(data_ddmmyyyy: str) -> str:
     return f"{y}-{m}-{d}"
 
 
+def _from_mcp_date(data_yyyy_mm_dd: str) -> str:
+    """Converteix YYYY-MM-DD a DD/MM/YYYY."""
+    y, m, d = data_yyyy_mm_dd.split("-")
+    return f"{d}/{m}/{y}"
+
+
+def _normalize_plain_text(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(text.lower().strip().split())
+
+
+def _nubehit_url_from_current(current_url: str | None = None) -> str | None:
+    current_url = (current_url or os.getenv("MCP_URL") or getattr(mcp_module, "MCP_URL", "") or "").strip()
+    match = MCP_TOKEN_RE.search(current_url)
+    if not match:
+        return None
+    return f"https://mcp.nubehit.com/mcp/{match.group(1)}"
+
+
+def _set_runtime_mcp_url(url: str) -> None:
+    os.environ["MCP_URL"] = url
+    mcp_module.MCP_URL = url
+    try:
+        mcp._session_id = None
+    except Exception:
+        pass
+
+
+def _replace_env_value(path: Path, key: str, value: str) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^({re.escape(key)}=).*?$", re.MULTILINE)
+    if not pattern.search(text):
+        return False
+    new_text = pattern.sub(rf"\g<1>{value}", text)
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def _persist_mcp_url(url: str) -> list[str]:
+    base = Path(__file__).resolve().parent
+    targets = [
+        (base / ".env", "MCP_URL"),
+        (base.parent / "comandesHitProbes" / ".env", "MCP_URL"),
+        (base.parent / "FACTURES REBUDES ITERUM 2026" / ".env", "HITSYSTEMS_MCP_URL"),
+    ]
+    updated = []
+    for path, key in targets:
+        try:
+            if _replace_env_value(path, key, url):
+                updated.append(str(path))
+        except Exception:
+            logger.exception("No s'ha pogut actualitzar %s", path)
+    return updated
+
+
 DIES_CA = ["Dil", "Dim", "Dmc", "Dij", "Div", "Dis", "Diu"]
 
 
@@ -224,12 +287,37 @@ def _manual_order_text(pending: dict) -> str:
 def _manual_order_keyboard(pending: dict) -> InlineKeyboardMarkup:
     rows = _order_field_buttons(pending.get("fields", set()), "order")
     if pending.get("mode") == "delete":
-        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:1")])
+        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:auto")])
     else:
         rows.append([
             InlineKeyboardButton("✅ Afegir", callback_data="order_apply:1"),
             InlineKeyboardButton("📦 Encarreg", callback_data="order_apply:2"),
         ])
+    rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _order_type_label(line: dict) -> str:
+    order_type = int(line.get("order_type", 1) or 1)
+    name = line.get("order_type_name") or ""
+    qty = f"D{line.get('requested', 0)}/S{line.get('served', 0)}/T{line.get('returned', 0)}"
+    if order_type == 1:
+        label = "Normal"
+    elif order_type == 2:
+        label = "Encarreg"
+    else:
+        label = name if name and not name.startswith("unknown") else f"Tipus {order_type}"
+    return f"{label} ({qty})"
+
+
+def _order_type_choice_keyboard(pending: dict, linies: list[dict]) -> InlineKeyboardMarkup:
+    rows = _order_field_buttons(pending.get("fields", set()), "order")
+    for line in linies:
+        order_type = int(line.get("order_type", 1) or 1)
+        rows.append([InlineKeyboardButton(
+            f"🗑️ {_order_type_label(line)}",
+            callback_data=f"order_apply:{order_type}",
+        )])
     rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -1361,6 +1449,136 @@ async def _handle_ai_answer(update, context, answer, estat_msg, transcript=None)
         await update.message.reply_text("❌ Resposta inesperada de la IA.")
 
 
+def _looks_operational_ai_request(text: str) -> bool:
+    t = _normalize_plain_text(text)
+    problem_words = ("problema", "falla", "fallat", "error", "arregla", "arreglal", "mcp", "automatic", "automatica")
+    action_words = ("envia", "enviar", "imprimeix", "imprimir", "comandes", "albarans")
+    return any(w in t for w in problem_words) and any(w in t for w in action_words)
+
+
+def _operational_request_date(text: str) -> tuple[str, str]:
+    parsed = _parse_all_orders_date(text)
+    if parsed:
+        return _to_mcp_date(parsed), parsed
+    t = _normalize_plain_text(text)
+    target = date.today() + timedelta(days=1)
+    if "avui" in t:
+        target = date.today()
+    return target.isoformat(), target.strftime("%d/%m/%Y")
+
+
+async def _try_mcp_orders(url: str, data_mcp: str) -> tuple[dict | None, str | None]:
+    previous = getattr(mcp_module, "MCP_URL", "")
+    _set_runtime_mcp_url(url)
+    probe = MCPVendes()
+    try:
+        return await probe.comandes_per_data(data_mcp), None
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        _set_runtime_mcp_url(previous)
+
+
+async def _prepare_operational_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    if not _looks_operational_ai_request(text):
+        return False
+    if not _is_admin(update):
+        await _deny_scope(update, "❌ Només els administradors poden fer diagnòstic i enviament operatiu.")
+        return True
+
+    data_mcp, data_display = _operational_request_date(text)
+    status = await update.message.reply_text(f"🔎 Provo l'MCP actual per al {data_display}...")
+
+    current_url = (getattr(mcp_module, "MCP_URL", "") or os.getenv("MCP_URL") or "").strip()
+    candidates = []
+    if current_url:
+        candidates.append(("actual", current_url))
+    nubehit_url = _nubehit_url_from_current(current_url)
+    if nubehit_url and nubehit_url not in [url for _, url in candidates]:
+        candidates.append(("nubehit", nubehit_url))
+
+    errors = []
+    chosen_label = None
+    chosen_url = None
+    result = None
+
+    for label, url in candidates:
+        try:
+            await status.edit_text(f"🔎 Provo MCP {label} per al {data_display}...")
+        except Exception:
+            pass
+        result, error = await _try_mcp_orders(url, data_mcp)
+        if error:
+            errors.append(f"{label}: {error[:180]}")
+            continue
+        chosen_label = label
+        chosen_url = url
+        break
+
+    if result is None or chosen_url is None:
+        await status.edit_text(
+            "❌ No he pogut consultar les comandes: l'MCP no respon correctament.\n\n"
+            + "\n".join(f"• {e}" for e in errors[:3])
+        )
+        return True
+
+    clients = result.get("clients", [])
+    if not clients:
+        await status.edit_text(f"ℹ️ MCP {chosen_label} respon, però no hi ha comandes imprimibles per al {data_display}.")
+        return True
+
+    printable = []
+    total_copies = 0
+    for client in clients:
+        codi = int(client.get("codi"))
+        nom = client.get("nom", str(codi))
+        copies = _get_copies(codi)
+        printable.append({"codi": codi, "nom": nom, "copies": copies})
+        total_copies += copies
+
+    context.user_data["pending_operational_send"] = {
+        "date_mcp": data_mcp,
+        "date_display": data_display,
+        "url": chosen_url,
+        "clients": printable,
+    }
+
+    lines = [f"• {c['nom']} x{c['copies']}" for c in printable[:20]]
+    await status.edit_text(
+        "✅ He trobat un MCP funcional i comandes per enviar.\n\n"
+        f"MCP: {chosen_label}\n"
+        f"Data: {data_display}\n"
+        f"Clients: {len(printable)}\n"
+        f"Còpies: {total_copies}\n\n"
+        "Clients:\n" + "\n".join(lines) + "\n\n"
+        "Si confirmes, deixaré aquesta URL MCP guardada i enviaré les comandes.\n\n"
+        "Confirmes enviar ara?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Enviar ara", callback_data="op_send_yes")],
+            [InlineKeyboardButton("❌ Cancel·lar", callback_data="op_send_no")],
+        ]),
+    )
+    return True
+
+
+async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not autoritzat(update):
+            await rebuig(update, context)
+            return
+        text = " ".join(context.args or []).strip()
+        if not text:
+            await update.message.reply_text("Escriu el que necessites després de /ia, per exemple: /ia arregla l'enviament automàtic i envia les comandes de demà")
+            return
+        if await _prepare_operational_send(update, context, text):
+            return
+        await _ask_ai(update, context, text)
+    except Exception as exc:
+        logger.exception("Error processant /ia")
+        if update.message:
+            await update.message.reply_text(f"❌ He tingut un error processant /ia, però no estic encallat: {exc}")
+
+
 async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autoritzat(update):
         await rebuig(update, context)
@@ -1375,6 +1593,14 @@ async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "stop":
         context.user_data.clear()
         await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    try:
+        if await _prepare_operational_send(update, context, text):
+            return
+    except Exception as exc:
+        logger.exception("Error processant petició operativa per text")
+        await update.message.reply_text(f"❌ He tingut un error processant la petició operativa, però no estic encallat: {exc}")
         return
 
     if await _send_hourly_sales_report(update, text):
@@ -1695,9 +1921,35 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["pending_order_edit"] = pending
             await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
             return
-        order_type = int(data.split(":", 1)[1])
+        order_type_raw = data.split(":", 1)[1]
         quantity = int(pending.get("quantity", 0))
         kwargs = {ORDER_FIELD_KWARGS[f]: quantity for f in fields}
+        if order_type_raw == "auto":
+            linies = await mcp.linies_article_comanda(
+                pending["date_mcp"],
+                pending["client_code"],
+                pending["article_code"],
+            )
+            linies_actives = [
+                line for line in linies
+                if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0)
+            ]
+            candidates = linies_actives or linies
+            if len(candidates) == 1:
+                order_type = int(candidates[0].get("order_type", 1) or 1)
+            elif len(candidates) > 1:
+                context.user_data["pending_order_edit"] = pending
+                await query.edit_message_text(
+                    _manual_order_text(pending)
+                    + "\n\n⚠️ Aquest producte existeix amb més d'un tipus. Tria quina línia vols canviar:",
+                    parse_mode="Markdown",
+                    reply_markup=_order_type_choice_keyboard(pending, candidates),
+                )
+                return
+            else:
+                order_type = 1
+        else:
+            order_type = int(order_type_raw)
         logger.info(
             "order_apply user=%s order_type=%s fields=%s kwargs=%s pending=%s",
             query.from_user.id,
@@ -1814,6 +2066,66 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=target_user_id,
             text="❌ L'administrador no ha autoritzat l'accés al bot.",
         )
+        return
+
+    if data == "op_send_no":
+        context.user_data.pop("pending_operational_send", None)
+        await query.edit_message_text("❌ Enviament operatiu cancel·lat.")
+        return
+
+    if data == "op_send_yes":
+        if not _is_admin(update):
+            await query.message.reply_text("❌ No autoritzat.")
+            return
+        pending = context.user_data.pop("pending_operational_send", None)
+        if not pending:
+            await query.edit_message_text("❌ No hi ha cap enviament pendent.")
+            return
+
+        data_mcp = pending["date_mcp"]
+        data_display = pending["date_display"]
+        url = pending["url"]
+        clients = pending.get("clients", [])
+        _set_runtime_mcp_url(url)
+        _persist_mcp_url(url)
+
+        await query.edit_message_text(f"⏳ Enviant comandes del {data_display}...")
+        impresos = []
+        errors = []
+        total_copies = 0
+        for client in clients:
+            codi = int(client["codi"])
+            nom = client.get("nom", str(codi))
+            copies = int(client.get("copies", 1) or 1)
+            logger.info("Enviament operatiu: imprimint date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
+            try:
+                result = await mcp.imprimir_albarans(data_mcp, codi, copies)
+                if isinstance(result, dict) and "error" in result:
+                    errors.append(f"{nom}: {result.get('error')}")
+                else:
+                    impresos.append(f"{nom} x{copies}")
+                    total_copies += copies
+            except Exception as exc:
+                logger.exception("Enviament operatiu: error client=%s", codi)
+                errors.append(f"{nom}: {exc}")
+
+        if errors:
+            text = (
+                "⚠️ Enviament acabat amb errors.\n\n"
+                f"📅 {data_display}\n"
+                f"Clients enviats: {len(impresos)}\n"
+                f"Còpies: {total_copies}\n\n"
+                "Errors:\n" + "\n".join(f"• {e}" for e in errors[:10])
+            )
+        else:
+            text = (
+                "✅ Comandes enviades correctament.\n\n"
+                f"📅 {data_display}\n"
+                f"Clients: {len(impresos)}\n"
+                f"Còpies: {total_copies}\n\n"
+                "Clients enviats:\n" + "\n".join(f"• {i}" for i in impresos[:25])
+            )
+        await query.message.reply_text(text)
         return
 
     if data == "confirm_no":
@@ -2649,7 +2961,22 @@ async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     data_mcp = _to_mcp_date(d["data"])
-    result = await mcp.afegir_linia_mcp(data_mcp, client_code, article_code, 0, 1)
+    linies = await mcp.linies_article_comanda(data_mcp, client_code, article_code)
+    linies_actives = [
+        line for line in linies
+        if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0)
+    ]
+    candidates = linies_actives or linies
+    order_type = int(candidates[0].get("order_type", 1) or 1) if len(candidates) == 1 else 1
+    result = await mcp.canviar_linia_mcp(
+        data_mcp,
+        client_code,
+        article_code,
+        order_type,
+        requested_quantity=0,
+        served_quantity=0,
+        returned_quantity=0,
+    )
     ok = result.get("ok", False)
 
     await _tancar_estat(estat_msg)
@@ -3404,6 +3731,7 @@ def run_bot():
     app.add_handler(CommandHandler("ajuda", cmd_start))
     app.add_handler(CommandHandler("imprimir_text", cmd_imprimir_text))
     app.add_handler(CommandHandler("cua_impressio", cmd_cua_impressio))
+    app.add_handler(CommandHandler("ia", cmd_ia))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(afegir_handler)
     app.add_handler(esborrar_handler)
