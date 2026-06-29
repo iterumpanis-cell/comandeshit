@@ -489,7 +489,11 @@ def _is_all_orders_request(text: str) -> bool:
     wants_all = any(word in t for word in ("totes", "tots", "tota", "tot el"))
     wants_orders = any(word in t for word in ("comand", "albar"))
     wants_plural_orders = any(word in t for word in ("comandes", "albarans"))
-    return wants_orders and (wants_all or (_is_print_request(text) and wants_plural_orders))
+    wants_all_clients = wants_all and "client" in t and _parse_all_orders_date(text)
+    return bool(
+        (wants_orders and (wants_all or (_is_print_request(text) and wants_plural_orders)))
+        or wants_all_clients
+    )
 
 
 def _format_all_orders_blocks(data: str, result: dict) -> list[str]:

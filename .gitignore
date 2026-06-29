@@ -8,3 +8,5 @@ bot.lock
 authorized_users.json
 auto_envia_state/
 .claude/
+.opencode/
+opencode.json
