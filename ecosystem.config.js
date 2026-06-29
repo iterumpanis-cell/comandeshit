@@ -20,7 +20,7 @@ module.exports = {
       args: "bot.py --mode auto_envia",
       cwd: "C:\\Users\\Usuario\\CLAUDE CODE\\hitsystems-bot",
       interpreter: "none",
-      cron_restart: "0 18 * * 1-5",
+      cron_restart: "0 13 * * 1-5",
       autorestart: false,
       watch: false,
       env: {
