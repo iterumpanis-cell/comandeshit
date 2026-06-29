@@ -1,5 +1,16 @@
 Projecte: COMANDES HIT
 
+Separacio produccio/proves:
+- Aquesta carpeta es el bot de proves: C:\Users\Usuario\CLAUDE CODE\comandesHitProbes.
+- El bot de produccio viu separat a: C:\Users\Usuario\CLAUDE CODE\hitsystems-bot.
+- Branques git: main queda aparcada, proves es per desenvolupar/provar, produccio es la versio estable real.
+- El token Telegram, .env, memoria local, autoritzacions i logs no s'han de pujar al git.
+- El bot de proves no executa auto_envia per cron/PM2; nomes fa enviaments si un usuari autoritzat ho demana explicitament.
+- El bot de produccio si mante els autoenviaments programats.
+- El bot de proves te comandes IA/admin: /ia_ajuda, /ia, /ia_tasques, /ia_resultat, /ia_cancel, /estat, /logs_produccio, /logs_proves, /ultim_error, /incidencies.
+- /ia crea una tasca OpenCode automatica processada per ia-worker-proves. Pot corregir nomes el bot de proves; no pot tocar produccio, .env, secrets, commits, push ni auto_envia.
+- Quan proves tingui una versio validada, passar els canvis cap a produccio de forma controlada.
+
 Memoria operativa:
 - Els canvis de comanda/albara han de demanar sempre si la quantitat afecta Demanat, Servit i/o Tornat.
 - Es pot seleccionar mes d'un camp alhora, especialment Demanat + Servit.

@@ -12,13 +12,13 @@ import os
 import re
 import tempfile
 import unicodedata
+import zipfile
 from difflib import SequenceMatcher
 from html import escape
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, Bot
-from telegram.constants import ChatAction
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,9 +30,19 @@ from telegram.ext import (
 )
 
 import config
-from gemini_hit import GeminiHitAssistant, NEEDS_SELECTION, NEEDS_CONFIRMATION
+from gemini_hit import GeminiHitAssistant
 from mcp_vendes import MCPVendes
 from printer import _format_totals_escpos, imprimir_text_directe
+from services.auth import AuthStore, normalize_phone
+from services.auto_send import AutoSender
+from telegram_handlers.ai_chat import register_ai_chat_handlers
+from telegram_handlers.callbacks import register_callback_handlers
+from telegram_handlers.ia_admin import register_ia_admin_handlers
+from telegram_handlers.orders_add import build_afegir_handler
+from telegram_handlers.orders_delete import build_esborrar_handler
+from telegram_handlers.orders_view import build_veure_handler
+from telegram_handlers.printing import build_imprimir_handler
+from telegram_handlers.sales import build_vendes_handler
 
 # ------------------------------------------------------------------ #
 #  Logging                                                             #
@@ -41,6 +51,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 PERSISTENCE_PATH = Path(__file__).with_name("bot_state.pkl")
 AUTHORIZED_USERS_PATH = Path(__file__).with_name("authorized_users.json")
@@ -111,18 +123,6 @@ def _get_copies(client_code: int) -> int:
     except Exception:
         return 2
 
-# ------------------------------------------------------------------ #
-#  Estats de la conversa                                              #
-# ------------------------------------------------------------------ #
-(
-    AF_CLIENT, AF_CLIENT_OPCIO, AF_DATA, AF_PRODUCTE, AF_PRODUCTE_OPCIO, AF_QUANTITAT, AF_CONFIRMAR,
-    VR_CLIENT, VR_CLIENT_OPCIO, VR_DATA,
-    EB_CLIENT, EB_CLIENT_OPCIO, EB_DATA, EB_PRODUCTE, EB_PRODUCTE_OPCIO, EB_CONFIRMAR,
-    VD_SHOP, VD_DATE, VD_REPORT,
-    IM_DATA, IM_CLIENT, IM_CLIENT_OPCIO, IM_COPIES, IM_SEGUENT,
-    IM_TIPUS, IM_TEXT,
-) = range(26)
-
 # Instàncies globals
 mcp = MCPVendes()
 
@@ -131,6 +131,24 @@ ai = GeminiHitAssistant(
     config.GEMINI_MODEL,
     mcp,
     config.GEMINI_FALLBACK_MODELS,
+)
+
+auth_store = AuthStore(
+    AUTHORIZED_USERS_PATH,
+    admin_user_id=config.ADMIN_USER_ID,
+    allowed_user_ids=config.ALLOWED_USER_IDS,
+)
+
+auto_sender = AutoSender(
+    state_dir=AUTO_ENVIA_STATE_DIR,
+    telegram_token=config.TELEGRAM_TOKEN,
+    logger=logger,
+    mcp=mcp,
+    get_copies=_get_copies,
+    load_auth_data=lambda: _load_auth_data(),
+    get_admin_user_id=lambda: _get_admin_user_id(),
+    format_totals_escpos=_format_totals_escpos,
+    imprimir_text_directe=imprimir_text_directe,
 )
 
 
@@ -224,12 +242,37 @@ def _manual_order_text(pending: dict) -> str:
 def _manual_order_keyboard(pending: dict) -> InlineKeyboardMarkup:
     rows = _order_field_buttons(pending.get("fields", set()), "order")
     if pending.get("mode") == "delete":
-        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:1")])
+        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:auto")])
     else:
         rows.append([
             InlineKeyboardButton("✅ Afegir", callback_data="order_apply:1"),
             InlineKeyboardButton("📦 Encarreg", callback_data="order_apply:2"),
         ])
+    rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _order_type_label(line: dict) -> str:
+    order_type = int(line.get("order_type", 1) or 1)
+    name = line.get("order_type_name") or ""
+    qty = f"D{line.get('requested', 0)}/S{line.get('served', 0)}/T{line.get('returned', 0)}"
+    if order_type == 1:
+        label = "Normal"
+    elif order_type == 2:
+        label = "Encarreg"
+    else:
+        label = name if name and not name.startswith("unknown") else f"Tipus {order_type}"
+    return f"{label} ({qty})"
+
+
+def _order_type_choice_keyboard(pending: dict, linies: list[dict]) -> InlineKeyboardMarkup:
+    rows = _order_field_buttons(pending.get("fields", set()), "order")
+    for line in linies:
+        order_type = int(line.get("order_type", 1) or 1)
+        rows.append([InlineKeyboardButton(
+            f"🗑️ {_order_type_label(line)}",
+            callback_data=f"order_apply:{order_type}",
+        )])
     rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -284,12 +327,25 @@ def _parse_data(text: str) -> str | None:
     if t in ("demà", "dema", "mañana", "tomorrow"):
         return (date.today() + timedelta(days=1)).strftime("%d/%m/%Y")
 
-    # Format complet DD/MM/YYYY
-    try:
-        datetime.strptime(t, "%d/%m/%Y")
-        return t.strip()
-    except ValueError:
-        pass
+    # Format complet DD/MM/YYYY o DD/MM/YY
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+        try:
+            parsed = datetime.strptime(t, fmt)
+            return parsed.strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+
+    m_full = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})\b', t)
+    if m_full:
+        d_str = m_full.group(1).zfill(2)
+        mo_str = m_full.group(2).zfill(2)
+        y_str = m_full.group(3)
+        fmt = "%d/%m/%y" if len(y_str) == 2 else "%d/%m/%Y"
+        try:
+            parsed = datetime.strptime(f"{d_str}/{mo_str}/{y_str}", fmt)
+            return parsed.strftime("%d/%m/%Y")
+        except ValueError:
+            return None
 
     # Format botó "Dij 03/04" → extreure DD/MM i afegir any
     m = re.search(r'\b(\d{1,2})/(\d{1,2})\b', t)
@@ -401,7 +457,11 @@ def _is_all_orders_request(text: str) -> bool:
     wants_all = any(word in t for word in ("totes", "tots", "tota", "tot el"))
     wants_orders = any(word in t for word in ("comand", "albar"))
     wants_plural_orders = any(word in t for word in ("comandes", "albarans"))
-    return wants_orders and (wants_all or (_is_print_request(text) and wants_plural_orders))
+    wants_all_clients = wants_all and "client" in t and _parse_all_orders_date(text)
+    return bool(
+        (wants_orders and (wants_all or (_is_print_request(text) and wants_plural_orders)))
+        or wants_all_clients
+    )
 
 
 def _format_all_orders_blocks(data: str, result: dict) -> list[str]:
@@ -453,6 +513,138 @@ async def _send_html_blocks(message, blocks: list[str], max_size: int = 3400):
             chunk = candidate
     if chunk:
         await message.reply_text(chunk, parse_mode="HTML")
+
+
+def _is_product_summary_excel_request(text: str) -> bool:
+    normalized = _normalize_search_text(text)
+    wants_excel = any(word in normalized for word in ("excel", "xlsx", "full de calcul", "hoja de calcul"))
+    wants_summary = any(word in normalized for word in ("resum", "resumen", "total", "totals"))
+    wants_products = any(word in normalized for word in ("product", "article", "articulo", "articles", "productos"))
+    wants_clients = "client" in normalized
+    return wants_excel and wants_summary and wants_products and wants_clients
+
+
+def _xlsx_cell_ref(col: int, row: int) -> str:
+    letters = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return f"{letters}{row}"
+
+
+def _xlsx_cell(value, row: int, col: int) -> str:
+    ref = _xlsx_cell_ref(col, row)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"><v>{value}</v></c>'
+    text = escape("" if value is None else str(value), quote=False)
+    return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def _write_product_summary_xlsx(path: Path, rows: list[list[object]]) -> None:
+    sheet_rows = []
+    for r_idx, row in enumerate(rows, start=1):
+        cells = "".join(_xlsx_cell(value, r_idx, c_idx) for c_idx, value in enumerate(row, start=1))
+        sheet_rows.append(f'<row r="{r_idx}">{cells}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="45" customWidth="1"/>'
+        '<col min="3" max="99" width="14" customWidth="1"/></cols>'
+        f'<sheetData>{"".join(sheet_rows)}</sheetData></worksheet>'
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Resum productes" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", rels_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+
+async def _send_product_summary_excel(update: Update, data: str) -> None:
+    data_mcp = _to_mcp_date(data)
+    estat_msg = await update.message.reply_text(f"⏳ Preparant Excel del resum de productes del {data}...")
+    try:
+        result = await mcp.comandes_per_data(data_mcp, incloure_botigues=True)
+        clients: list[tuple[str, str]] = []
+        productes: dict[tuple[str, str], dict[str, object]] = {}
+        for client in result.get("clients", []):
+            client_code = str(client.get("codi") or client.get("code") or client.get("id") or "")
+            client_name = str(client.get("nom") or client.get("name") or client_code or "Client")
+            client_key = client_code or client_name
+            clients.append((client_key, client_name))
+            for line in client.get("linies", []):
+                qty = int(line.get("requested", 0) or 0)
+                if qty <= 0:
+                    continue
+                code = str(line.get("art") or line.get("code") or "")
+                name = str(line.get("nm") or line.get("artName") or line.get("name") or code or "Producte")
+                item = productes.setdefault((code, name), {"total": 0, "clients": {}})
+                item["total"] = int(item["total"]) + qty
+                per_client = item["clients"]
+                per_client[client_key] = int(per_client.get(client_key, 0)) + qty
+
+        rows: list[list[object]] = [
+            ["Resum per productes", data, "", ""],
+            ["Clients amb comanda", len(clients), "Productes", len(productes)],
+            [],
+            ["Codi producte", "Producte", *[name for _, name in clients], "Total"],
+        ]
+        for (code, name), item in sorted(productes.items(), key=lambda kv: (-int(kv[1]["total"]), kv[0][1].lower())):
+            per_client = item["clients"]
+            rows.append([
+                code,
+                name,
+                *[int(per_client.get(client_key, 0)) or "" for client_key, _ in clients],
+                int(item["total"]),
+            ])
+
+        filename = f"resum_productes_{data_mcp}.xlsx"
+        path = Path(tempfile.gettempdir()) / filename
+        _write_product_summary_xlsx(path, rows)
+        await _tancar_estat(estat_msg)
+        with path.open("rb") as fh:
+            await update.message.reply_document(
+                document=fh,
+                filename=filename,
+                caption=f"Resum per productes de tots els clients amb comanda del {data}",
+            )
+    except Exception as exc:
+        logger.exception("Error generant Excel de resum de productes")
+        try:
+            await estat_msg.edit_text("❌")
+        except Exception:
+            pass
+        await update.message.reply_text(f"❌ Error generant l'Excel: {exc}")
 
 
 def _parse_sales_date(text: str) -> tuple[str, str] | None:
@@ -829,96 +1021,36 @@ def _clear_pending_selection(context: ContextTypes.DEFAULT_TYPE, poll_id: str | 
         _pending_polls(context).pop(poll_id, None)
 
 
-def _default_auth_data() -> dict:
-    authorized = sorted({*config.ALLOWED_USER_IDS, *([config.ADMIN_USER_ID] if config.ADMIN_USER_ID else [])})
-    users = {}
-    for uid in authorized:
-        users[str(uid)] = {"role": "admin" if uid == config.ADMIN_USER_ID else "client"}
-    return {
-        "admin_user_id": config.ADMIN_USER_ID,
-        "authorized_users": authorized,
-        "users": users,
-        "pending_requests": {},
-    }
-
-
 def _load_auth_data() -> dict:
-    if not AUTHORIZED_USERS_PATH.exists():
-        data = _default_auth_data()
-        AUTHORIZED_USERS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return data
-
-    try:
-        data = json.loads(AUTHORIZED_USERS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        data = _default_auth_data()
-
-    data.setdefault("admin_user_id", config.ADMIN_USER_ID)
-    data.setdefault("authorized_users", [])
-    data.setdefault("users", {})
-    data.setdefault("pending_requests", {})
-
-    if config.ADMIN_USER_ID and config.ADMIN_USER_ID not in data["authorized_users"]:
-        data["authorized_users"].append(config.ADMIN_USER_ID)
-    for uid in config.ALLOWED_USER_IDS:
-        if uid not in data["authorized_users"]:
-            data["authorized_users"].append(uid)
-
-    data["authorized_users"] = sorted({int(uid) for uid in data["authorized_users"]})
-    users = data["users"]
-    for uid in data["authorized_users"]:
-        key = str(uid)
-        users.setdefault(key, {})
-        users[key].setdefault("role", "admin" if uid == config.ADMIN_USER_ID else "client")
-    if config.ADMIN_USER_ID:
-        users.setdefault(str(config.ADMIN_USER_ID), {})
-        users[str(config.ADMIN_USER_ID)]["role"] = "admin"
-    return data
+    return auth_store.load()
 
 
 def _save_auth_data(data: dict) -> None:
-    users = data.get("users", {})
-    data["authorized_users"] = sorted({int(uid) for uid in users.keys()})
-    AUTHORIZED_USERS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    auth_store.save(data)
 
 
 def _get_admin_user_id() -> int | None:
-    data = _load_auth_data()
-    admin_id = data.get("admin_user_id")
-    return int(admin_id) if admin_id else None
+    return auth_store.get_admin_user_id()
 
 
 def _is_authorized_user(user_id: int) -> bool:
-    data = _load_auth_data()
-    return str(int(user_id)) in data.get("users", {})
+    return auth_store.is_authorized_user(user_id)
 
 
 def _get_user_profile(user_id: int) -> dict | None:
-    data = _load_auth_data()
-    return data.get("users", {}).get(str(int(user_id)))
+    return auth_store.get_user_profile(user_id)
 
 
 def _is_admin_user(user_id: int) -> bool:
-    profile = _get_user_profile(user_id)
-    return bool(profile and profile.get("role") == "admin")
+    return auth_store.is_admin_user(user_id)
 
 
 def _get_client_scope(user_id: int) -> tuple[int | None, str | None]:
-    profile = _get_user_profile(user_id) or {}
-    client_code = profile.get("client_code")
-    client_name = profile.get("client_name")
-    return (int(client_code) if client_code is not None else None, client_name)
-
-
-def _normalize_phone(phone: str) -> str:
-    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
-    if digits.startswith("34") and len(digits) > 9:
-        digits = digits[2:]
-    return digits
+    return auth_store.get_client_scope(user_id)
 
 
 async def _search_clients_by_phone(phone: str) -> list[dict]:
-    normalized = _normalize_phone(phone)
+    normalized = normalize_phone(phone)
     if not normalized:
         return []
 
@@ -928,7 +1060,7 @@ async def _search_clients_by_phone(phone: str) -> list[dict]:
 
     matches = []
     for item in clients:
-        client_phone = _normalize_phone(str(item.get("t", "")))
+        client_phone = normalize_phone(str(item.get("t", "")))
         if client_phone and client_phone == normalized:
             matches.append(item)
     return matches
@@ -1059,7 +1191,7 @@ async def handle_contact_share(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("❌ Has d'enviar el teu propi contacte de Telegram.")
         return
 
-    normalized_phone = _normalize_phone(contact.phone_number)
+    normalized_phone = normalize_phone(contact.phone_number)
     matches = await _search_clients_by_phone(contact.phone_number)
     clean_matches = [m for m in matches if isinstance(m, dict) and "c" in m and "n" in m]
 
@@ -1184,6 +1316,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /esborrar — Esborrar producte d'una comanda\n"
         "• /veure    — Veure albarà d'un client\n"
         "• /imprimir — Imprimir albarans\n"
+        "• /hora    — Mostrar l'hora actual\n"
         "• /reset    — Reiniciar la conversa amb la IA\n"
         "• /cancel   — Cancel·lar operació en curs\n"
         "• /ajuda    — Mostrar aquesta ajuda\n\n"
@@ -1191,18 +1324,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "La IA usarà Gemini i les eines MCP de HitSystems quan calgui.\n\n"
         f"El teu ID de Telegram és: `{uid}`"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([["🕒 Hora actual"]], resize_keyboard=True),
+    )
 
 
-def _history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    return context.user_data.setdefault("ai_history", [])
-
-
-def _push_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str):
-    history = _history(context)
-    history.append({"role": role, "text": text})
-    if len(history) > 12:
-        del history[:-12]
+async def cmd_hora(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autoritzat(update):
+        await rebuig(update, context)
+        return
+    ara = datetime.now()
+    hora = ara.strftime("%H:%M:%S")
+    dia = ara.strftime("%d/%m/%Y")
+    any_actual = ara.strftime("%Y")
+    await update.message.reply_text(f"🕒 Hora actual: {hora}\n📅 Dia: {dia}\n📆 Any: {any_actual}")
 
 
 async def _send_chunks(message, text: str, parse_mode: str | None = None):
@@ -1224,1750 +1361,12 @@ async def _tancar_estat(msg):
             pass
 
 
-async def _ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, transcript: str | None = None, estat_msg=None):
-    if not ai.enabled:
-        await update.message.reply_text("❌ Falta configurar `GEMINI_API_KEY` al fitxer `.env`.")
-        return
-
-    if estat_msg is None:
-        estat_msg = await update.message.reply_text("🤔 Processant...")
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    _TOPIC_CHANGE_KEYWORDS = ("vendes", "ventes", "sales", "imprimir", "imprim", "/vendes", "/imprimir")
-    is_topic_change = any(kw in prompt.lower() for kw in _TOPIC_CHANGE_KEYWORDS)
-
-    if _is_simple_greeting(prompt) or is_topic_change:
-        history = []
-        context.user_data.pop("pending_confirmation", None)
-        context.user_data.pop("pending_selection", None)
-        ai.last_context = {}
-    else:
-        history = list(_history(context))
-
-    # Injecta només la data del context (mai el codi client: pot ser incorrecte si l'usuari menciona el client pel nom)
-    ctx = ai.last_context
-    if ctx and ctx.get("date") and not (_is_simple_greeting(prompt) or is_topic_change):
-        prompt = f"[Context actual: data={ctx['date']}]\n{prompt}"
-
-    client_code, client_name = _bound_client(update)
-    effective_prompt = prompt
-    if not _is_admin(update) and client_code:
-        effective_prompt = (
-            f"[RESTRICCIO D'ACCÉS] Aquest usuari només pot operar sobre el client "
-            f"{client_name or client_code} (codi {client_code}). "
-            "No pots consultar ni modificar cap altre client. "
-            "Si l'usuari demana un altre client, rebutja-ho.\n\n"
-            f"{prompt}"
-        )
-
-    try:
-        answer = await ai.ask(effective_prompt, history)
-    except Exception as e:
-        logger.exception("Error cridant Gemini")
-        try:
-            await estat_msg.edit_text("❌")
-            await asyncio.sleep(0.5)
-            await estat_msg.delete()
-        except Exception:
-            pass
-        await update.message.reply_text(f"❌ Error amb Gemini: {e}")
-        return
-
-    stored_user_text = transcript if transcript is not None else prompt
-    _push_history(context, "user", stored_user_text)
-
-    await _handle_ai_answer(update, context, answer, estat_msg, transcript=transcript)
-
-
-async def _handle_ai_answer(update, context, answer, estat_msg, transcript=None):
-    """Processa la resposta de la IA: text normal, selecció o confirmació."""
-
-    # --- Necessita selecció d'usuari ---
-    if isinstance(answer, dict) and NEEDS_SELECTION in answer:
-        await _tancar_estat(estat_msg)
-        options = answer.get("options", [])
-        question = answer.get("question", "Selecciona una opció:")
-        contents = answer.get("__gemini_contents__", [])
-
-        selection_type = answer.get("selection_type", "article")
-
-        # Enviem enquesta de selecció única
-        poll_options = [o["n"][:100] for o in options if "n" in o]
-        if not poll_options:
-            await update.message.reply_text("❌ No s'han trobat opcions per seleccionar.")
-            return
-
-        msg = await context.bot.send_poll(
-            chat_id=update.effective_chat.id,
-            question=question[:300],
-            options=poll_options,
-            is_anonymous=False,
-            allows_multiple_answers=False,
-        )
-        # Guardem el poll_id per correlacionar la resposta.
-        _save_pending_selection(
-            context,
-            user_id=update.effective_user.id,
-            chat_id=update.effective_chat.id,
-            options=options,
-            contents=contents,
-            selection_type=selection_type,
-            poll_id=msg.poll.id,
-            message_id=msg.message_id,
-        )
-        return
-
-    # --- Necessita confirmació de comanda ---
-    if isinstance(answer, dict) and NEEDS_CONFIRMATION in answer:
-        await _tancar_estat(estat_msg)
-        lines = answer.get("lines", [])
-        contents = answer.get("__gemini_contents__", [])
-        client_code, client_name = _bound_client(update)
-        if not _is_admin(update) and client_code:
-            invalid = [line for line in lines if int(line.get("client", -1)) != int(client_code)]
-            if invalid:
-                await update.message.reply_text(
-                    f"❌ Només pots operar sobre les comandes de *{client_name or client_code}*.",
-                    parse_mode="Markdown",
-                )
-                return
-
-        fields = _initial_confirmation_fields(lines)
-        context.user_data["pending_confirmation"] = {
-            "lines": lines,
-            "contents": contents,
-            "fields": fields,
-            "choose_order_type": True,
-        }
-
-        await update.message.reply_text(
-            _confirmation_text(lines, fields),
-            parse_mode="Markdown",
-            reply_markup=_confirmation_keyboard(fields, choose_order_type=True),
-        )
-        return
-
-    # --- Resposta de text normal ---
-    await _tancar_estat(estat_msg)
-
-    if transcript is not None:
-        await _send_chunks(update.message, f"📝 _{transcript}_")
-
-    if isinstance(answer, str):
-        _push_history(context, "assistant", answer)
-        parse_mode = "HTML" if answer.lstrip().startswith("<pre>") else None
-        await _send_chunks(update.message, answer, parse_mode=parse_mode)
-    else:
-        await update.message.reply_text("❌ Resposta inesperada de la IA.")
-
-
-async def ai_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return
-
-    if not update.message or not update.message.text:
-        return
-    text = update.message.text.strip()
-    if not text:
-        return
-
-    if text.lower() == "stop":
-        context.user_data.clear()
-        await update.message.reply_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    if await _send_hourly_sales_report(update, text):
-        return
-
-    if _is_print_queue_request(text):
-        if not _is_admin(update):
-            await update.message.reply_text("Nomes els administradors poden veure la cua d'impressio.")
-            return
-        result = await mcp.cua_impressio()
-        await update.message.reply_text(_format_print_queue(result))
-        return
-
-    print_text = _extract_print_text(text)
-    if print_text is not None:
-        await _send_print_text(update, print_text)
-        return
-
-    if _is_all_orders_request(text) and _is_print_request(text):
-        if not _is_admin(update):
-            await _deny_scope(update, "❌ Només els administradors poden imprimir totes les comandes del dia.")
-            return
-
-        data = _parse_all_orders_date(text)
-        if not data:
-            await update.message.reply_text("⚠️ Digues la data, per exemple: imprimeix totes les comandes del dia 01/05.")
-            return
-
-        try:
-            await _print_all_orders(update, data)
-        except Exception as exc:
-            logger.exception("Error imprimint totes les comandes")
-            await update.message.reply_text(f"❌ Error imprimint les comandes: {exc}")
-        return
-
-    if _is_all_orders_request(text):
-        if not _is_admin(update):
-            await _deny_scope(update, "❌ Només els administradors poden consultar totes les comandes del dia.")
-            return
-
-        data = _parse_all_orders_date(text)
-        if not data:
-            await update.message.reply_text("⚠️ Digues la data, per exemple: totes les comandes del dia 01/05.")
-            return
-
-        estat_msg = await update.message.reply_text(f"⏳ Carregant totes les comandes del {data}...")
-        data_mcp = _to_mcp_date(data)
-        logger.info("Consulta directa totes les comandes: date=%s", data_mcp)
-        try:
-            result = await mcp.comandes_per_data(data_mcp)
-            blocks = _format_all_orders_blocks(data, result)
-            await _tancar_estat(estat_msg)
-            await _send_html_blocks(update.message, blocks)
-        except Exception as exc:
-            logger.exception("Error carregant totes les comandes")
-            try:
-                await estat_msg.edit_text("❌")
-            except Exception:
-                pass
-            await update.message.reply_text(f"❌ Error carregant les comandes: {exc}")
-        return
-
-    await _ask_ai(update, context, text)
-
-
-async def ai_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return
-
-    if not ai.enabled:
-        await update.message.reply_text("❌ Falta configurar `GEMINI_API_KEY` al fitxer `.env`.")
-        return
-
-    suffix = ".ogg"
-    voice = update.message.voice
-    if voice and voice.mime_type == "audio/ogg":
-        suffix = ".ogg"
-
-    temp_path = None
-    estat_msg = await update.message.reply_text("🎙️ Transcrivint l'àudio...")
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            temp_path = Path(temp_file.name)
-
-        telegram_file = await context.bot.get_file(voice.file_id)
-        await telegram_file.download_to_drive(custom_path=str(temp_path))
-
-        transcript = await ai.transcribe_audio(str(temp_path))
-        if not transcript:
-            await estat_msg.edit_text("❌ No he pogut transcriure l'àudio.")
-            return
-
-        if transcript.strip().lower() == "stop":
-            context.user_data.clear()
-            await estat_msg.edit_text("🛑 Aturat. Quan vulguis, escriu /afegir, /veure o /esborrar.")
-            return
-
-        await estat_msg.edit_text("🤔 Processant...")
-        await _ask_ai(update, context, transcript, transcript=transcript, estat_msg=estat_msg)
-    except Exception as e:
-        logger.exception("Error processant àudio")
-        try:
-            await estat_msg.delete()
-        except Exception:
-            pass
-        await update.message.reply_text(f"❌ Error processant l'àudio: {e}")
-    finally:
-        if temp_path and temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("ai_history", None)
-    ai.last_context = {}
-    await update.message.reply_text("🧹 Conversa amb la IA reiniciada.")
-
-
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Rep la resposta de l'usuari a l'enquesta de selecció."""
-    poll_answer = update.poll_answer
-    pending = context.user_data.get("pending_selection")
-    if pending and pending.get("poll_id") != poll_answer.poll_id:
-        pending = None
-    if not pending:
-        pending = _pending_polls(context).get(poll_answer.poll_id)
-    if not pending:
-        logger.warning(
-            "handle_poll_answer: cap seleccio pendent per poll_id=%s user_id=%s",
-            poll_answer.poll_id,
-            poll_answer.user.id,
-        )
-        await context.bot.send_message(
-            chat_id=poll_answer.user.id,
-            text="❌ No puc recuperar l'enquesta pendent. Torna a enviar la petició, si us plau.",
-        )
-        return
-
-    chat_id = pending.get("chat_id") or poll_answer.user.id
-
-    # Obtenim l'opció seleccionada
-    selected_idx = poll_answer.option_ids[0] if poll_answer.option_ids else None
-    if selected_idx is None:
-        logger.info("handle_poll_answer: resposta sense opcio per poll_id=%s", poll_answer.poll_id)
-        return
-
-    options = pending.get("options", [])
-    if selected_idx >= len(options):
-        logger.warning(
-            "handle_poll_answer: index fora de rang poll_id=%s idx=%s total=%s",
-            poll_answer.poll_id,
-            selected_idx,
-            len(options),
-        )
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ La selecció ja no és vàlida. Torna a enviar la petició, si us plau.",
-        )
-        return
-
-    selected = options[selected_idx]
-    contents = pending.get("contents", [])
-    _clear_pending_selection(context, poll_answer.poll_id)
-
-    # Tanquem el poll
-    try:
-        await context.bot.stop_poll(
-            chat_id=chat_id,
-            message_id=pending.get("message_id"),
-        )
-    except Exception:
-        logger.exception("handle_poll_answer: no s'ha pogut tancar el poll %s", poll_answer.poll_id)
-
-    # Afegim la selecció al historial de Gemini i continuem
-    from google.genai import types as gtypes
-    contents.append(gtypes.Content(
-        role="user",
-        parts=[gtypes.Part(text=f"L'usuari ha seleccionat: {selected['n']} (codi {selected['c']})")]
-    ))
-
-    # Enviem missatge d'estat i continuem la conversa
-    estat_msg = await context.bot.send_message(chat_id=chat_id, text="🤔 Processant selecció...")
-
-    try:
-        answer = await ai.continue_from_contents(contents)
-    except Exception as e:
-        logger.exception("Error continuant conversa després de selecció")
-        try:
-            await estat_msg.edit_text("❌")
-            await asyncio.sleep(0.5)
-            await estat_msg.delete()
-        except Exception:
-            pass
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
-        return
-
-    await _tancar_estat(estat_msg)
-
-    if isinstance(answer, dict) and NEEDS_SELECTION in answer:
-        # La IA necessita una altra selecció (article o client ambigu)
-        options = answer.get("options", [])
-        question = answer.get("question", "Selecciona una opció:")
-        new_contents = answer.get("__gemini_contents__", [])
-
-        selection_type = answer.get("selection_type", "article")
-
-        poll_options = [o["n"][:100] for o in options if "n" in o]
-        if not poll_options:
-            await context.bot.send_message(chat_id=chat_id, text="❌ No s'han trobat opcions per seleccionar.")
-            return
-
-        msg = await context.bot.send_poll(
-            chat_id=chat_id,
-            question=question[:300],
-            options=poll_options,
-            is_anonymous=False,
-            allows_multiple_answers=False,
-        )
-        _save_pending_selection(
-            context,
-            user_id=pending.get("user_id", poll_answer.user.id),
-            chat_id=chat_id,
-            options=options,
-            contents=new_contents,
-            selection_type=selection_type,
-            poll_id=msg.poll.id,
-            message_id=msg.message_id,
-        )
-
-    elif isinstance(answer, str):
-        _push_history(context, "assistant", answer)
-        parse_mode = "HTML" if answer.lstrip().startswith("<pre>") else None
-        for start in range(0, len(answer), 3500):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=answer[start:start+3500],
-                parse_mode=parse_mode,
-            )
-    elif isinstance(answer, dict) and NEEDS_CONFIRMATION in answer:
-        # La IA vol confirmar una comanda
-        lines = answer.get("lines", [])
-        new_contents = answer.get("__gemini_contents__", [])
-        fields = _initial_confirmation_fields(lines)
-        context.user_data["pending_confirmation"] = {
-            "lines": lines,
-            "contents": new_contents,
-            "fields": fields,
-            "choose_order_type": True,
-        }
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=_confirmation_text(lines, fields),
-            parse_mode="Markdown",
-            reply_markup=_confirmation_keyboard(fields, choose_order_type=True),
-        )
-    else:
-        logger.warning(f"handle_poll_answer: resposta inesperada tipus {type(answer)}: {str(answer)[:200]}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ No he pogut continuar després de la selecció. Torna a enviar la petició, si us plau.",
-        )
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     if error:
         logger.error("Error no gestionat al bot", exc_info=(type(error), error, error.__traceback__))
     else:
         logger.error("Error no gestionat al bot sense excepcio associada. update=%s", update)
-
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestiona la confirmació de comanda via inline keyboard."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("order_field:"):
-        pending = context.user_data.get("pending_order_edit")
-        if not pending:
-            await query.edit_message_text("❌ No hi ha cap canvi pendent.")
-            return
-        field = data.split(":", 1)[1]
-        fields = set(pending.get("fields", set()))
-        if field in fields:
-            fields.remove(field)
-        elif field in ORDER_FIELD_LABELS:
-            fields.add(field)
-        pending["fields"] = fields
-        logger.info(
-            "order_field toggle user=%s field=%s fields=%s pending=%s",
-            query.from_user.id,
-            field,
-            sorted(fields),
-            {k: pending.get(k) for k in ("mode", "client_code", "date_mcp", "article_code", "quantity")},
-        )
-        await query.edit_message_text(
-            _manual_order_text(pending),
-            parse_mode="Markdown",
-            reply_markup=_manual_order_keyboard(pending),
-        )
-        return
-
-    if data == "order_cancel":
-        context.user_data.pop("pending_order_edit", None)
-        await query.edit_message_text("❌ Canvi cancel·lat.")
-        return
-
-    if data.startswith("order_apply:"):
-        pending = context.user_data.pop("pending_order_edit", None)
-        if not pending:
-            await query.edit_message_text("❌ No hi ha cap canvi pendent.")
-            return
-        fields = set(pending.get("fields", set()))
-        if not fields:
-            context.user_data["pending_order_edit"] = pending
-            await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
-            return
-        order_type = int(data.split(":", 1)[1])
-        quantity = int(pending.get("quantity", 0))
-        kwargs = {ORDER_FIELD_KWARGS[f]: quantity for f in fields}
-        logger.info(
-            "order_apply user=%s order_type=%s fields=%s kwargs=%s pending=%s",
-            query.from_user.id,
-            order_type,
-            sorted(fields),
-            kwargs,
-            {k: pending.get(k) for k in ("mode", "client_code", "date_mcp", "article_code", "quantity")},
-        )
-        await query.edit_message_text("⏳ Aplicant canvi...")
-        result = await mcp.canviar_linia_mcp(
-            pending["date_mcp"],
-            pending["client_code"],
-            pending["article_code"],
-            order_type,
-            **kwargs,
-        )
-        if result.get("ok"):
-            action = "posat a 0" if quantity == 0 else f"posat a {quantity}"
-            await query.message.reply_text(
-                f"✅ Canvi aplicat correctament.\n\n"
-                f"👤 {pending['client_name']}\n"
-                f"📅 {pending['date_display']}\n"
-                f"🥖 {pending['article_name']}\n"
-                f"📌 {_format_order_fields(fields)}: {action}"
-            )
-        else:
-            await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
-        return
-
-    if data.startswith("confirm_field:"):
-        pending = context.user_data.get("pending_confirmation")
-        if not pending:
-            await query.edit_message_text("❌ No hi ha cap comanda pendent.")
-            return
-        field = data.split(":", 1)[1]
-        fields = set(pending.get("fields", {"requested", "served"}))
-        if field in fields:
-            fields.remove(field)
-        elif field in ORDER_FIELD_LABELS:
-            fields.add(field)
-        pending["fields"] = fields
-        logger.info(
-            "confirm_field toggle user=%s field=%s fields=%s lines=%s",
-            query.from_user.id,
-            field,
-            sorted(fields),
-            [
-                {k: line.get(k) for k in ("date", "client", "article_code", "quantity", "order_type")}
-                for line in pending.get("lines", [])
-            ],
-        )
-        await query.edit_message_text(
-            _confirmation_text(pending.get("lines", []), fields),
-            parse_mode="Markdown",
-            reply_markup=_confirmation_keyboard(fields, choose_order_type=pending.get("choose_order_type", False)),
-        )
-        return
-
-    if data.startswith("auth_client:") or data.startswith("auth_admin:") or data.startswith("auth_deny:"):
-        admin_id = _get_admin_user_id()
-        if query.from_user.id != admin_id:
-            await query.message.reply_text("❌ No autoritzat.")
-            return
-
-        parts = data.split(":")
-        action = parts[0]
-        target_user_id = int(parts[1])
-        auth_data = _load_auth_data()
-        pending = auth_data.setdefault("pending_requests", {}).pop(str(target_user_id), None)
-        users = auth_data.setdefault("users", {})
-
-        if action == "auth_client":
-            client_code = int(parts[2])
-            client_name = None
-            if pending:
-                for match in pending.get("matches", []):
-                    if int(match.get("c")) == client_code:
-                        client_name = match.get("n")
-                        break
-            users[str(target_user_id)] = {
-                "role": "client",
-                "client_code": client_code,
-                "client_name": client_name or f"codi {client_code}",
-                "granted_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            _save_auth_data(auth_data)
-            await query.edit_message_text(f"✅ Usuari autoritzat com a client: {users[str(target_user_id)]['client_name']}")
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=(
-                    f"✅ Ja tens accés al bot com a client de {users[str(target_user_id)]['client_name']}.\n"
-                    "Només podràs veure i gestionar les teves comandes."
-                ),
-            )
-            return
-
-        if action == "auth_admin":
-            users[str(target_user_id)] = {
-                "role": "admin",
-                "scope": "Cal Forner",
-                "granted_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            _save_auth_data(auth_data)
-            await query.edit_message_text("✅ Usuari autoritzat com a administratiu de Cal Forner")
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text="✅ Ja tens accés administratiu al bot. Pots veure i gestionar totes les dades disponibles.",
-            )
-            return
-
-        _save_auth_data(auth_data)
-        await query.edit_message_text(f"❌ Accés denegat: {target_user_id}")
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="❌ L'administrador no ha autoritzat l'accés al bot.",
-        )
-        return
-
-    if data == "confirm_no":
-        context.user_data.pop("pending_confirmation", None)
-        await query.edit_message_text("❌ Comanda cancel·lada.")
-        return
-
-    if data.startswith("confirm_yes"):
-        pending = context.user_data.pop("pending_confirmation", None)
-        if not pending:
-            await query.edit_message_text("❌ No hi ha cap comanda pendent.")
-            return
-        fields = set(pending.get("fields", {"requested", "served"}))
-        if not fields:
-            context.user_data["pending_confirmation"] = pending
-            await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
-            return
-        forced_order_type = None
-        if ":" in data:
-            try:
-                forced_order_type = int(data.split(":", 1)[1])
-            except ValueError:
-                forced_order_type = None
-
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        lines = pending.get("lines", [])
-        results = []
-        errors = []
-
-        for line in lines:
-            try:
-                order_type = forced_order_type if forced_order_type in (1, 2) else line.get("order_type", 1)
-                logger.info(
-                    "confirm_apply user=%s order_type=%s fields=%s line=%s",
-                    query.from_user.id,
-                    order_type,
-                    sorted(fields),
-                    {k: line.get(k) for k in ("date", "client", "article_code", "quantity", "order_type")},
-                )
-                result = await ai.execute_order(
-                    date=line["date"],
-                    client=line["client"],
-                    article_code=line["article_code"],
-                    quantity=line["quantity"],
-                    fields=fields,
-                    order_type=order_type,
-                )
-                if forced_order_type in (1, 2):
-                    line["order_type"] = forced_order_type
-                if result.get("ok"):
-                    results.append(line)
-                else:
-                    errors.append(f"❌ {line.get('article_name', '?')}: {result.get('error', '?')}")
-            except Exception as e:
-                errors.append(f"❌ {line.get('article_name', '?')}: {e}")
-
-        if results:
-            client_name = results[0].get("client_name", "?")
-            date_mcp = results[0].get("date", "?")
-            try:
-                updated_order = await mcp.veure_comanda(date_mcp, results[0]["client"])
-            except Exception as e:
-                updated_order = {"error": str(e)}
-
-            if "error" in updated_order:
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=(
-                        f"✅ Comanda aplicada a {client_name} ({date_mcp}).\n"
-                        f"❌ No he pogut carregar l'albarà actualitzat: {updated_order['error']}"
-                    ),
-                )
-            else:
-                ticket = _format_order_ticket(
-                    client_name,
-                    date_mcp,
-                    updated_order.get("order", []),
-                )
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=ticket,
-                    parse_mode="HTML",
-                )
-
-        if errors:
-            await context.bot.send_message(chat_id=query.message.chat_id, text="\n".join(errors))
-
-
-# ================================================================== #
-#  FLUX: /afegir                                                       #
-# ================================================================== #
-
-async def af_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    client_code, client_name = _bound_client(update)
-    if not _is_admin(update) and client_code:
-        context.user_data["client"] = client_name or f"codi {client_code}"
-        context.user_data["client_code"] = client_code
-        await update.message.reply_text(
-            f"📋 *Afegir producte a comanda*\n\n👤 Client fixat: *{context.user_data['client']}*",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return await _demanar_data(update)
-    await update.message.reply_text(
-        "📋 *Afegir producte a comanda*\n\nQuin *client*?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return AF_CLIENT
-
-
-async def af_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)  # [{"c": codi, "n": nom}]
-    except Exception as e:
-        logger.warning(f"af_client: cercar_client excepció: {e}")
-        resultats = []
-    try:
-        await cerca_msg.delete()
-    except Exception:
-        pass
-
-    opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
-    logger.info(f"af_client: {len(opcions)} opcions per '{text}': {opcions}")
-
-    if len(opcions) == 0:
-        await update.message.reply_text(
-            "❌ Client no trobat. Prova amb un nom diferent:",
-            parse_mode="Markdown",
-        )
-        return AF_CLIENT
-
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-
-    if len(coincidencies) == 1:
-        name, code = coincidencies[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data(update)
-
-    if len(opcions) == 1:
-        name, code = opcions[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data(update)
-
-    llista = coincidencies if len(coincidencies) > 1 else opcions
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-            parse_mode="Markdown",
-        )
-        return AF_CLIENT
-
-    context.user_data["client_opcions"] = {n: c for n, c in llista}
-    keyboard = [[n] for n, _ in llista]
-    keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
-    await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* clients per «{text}».\nSelecciona el correcte:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return AF_CLIENT_OPCIO
-
-
-async def af_client_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "❌" in text or "cap d'aquests" in text.lower():
-        await update.message.reply_text(
-            "👤 Torna a escriure el nom del *client*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return AF_CLIENT
-
-    opcions = context.user_data.get("client_opcions", {})
-    code = opcions.get(text)
-    context.user_data["client"] = text
-    context.user_data["client_code"] = code
-    await update.message.reply_text(
-        f"✅ Client: *{text}*", parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return await _demanar_data(update)
-
-
-async def _demanar_data(update: Update):
-    await update.message.reply_text(
-        "📅 Quina *data*?",
-        parse_mode="Markdown",
-        reply_markup=_keyboard_dates(),
-    )
-    return AF_DATA
-
-
-async def af_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    # Botó "Altra data" → tornar a mostrar teclat demanant entrada manual
-    if "altra data" in text.lower():
-        await update.message.reply_text(
-            "✏️ Escriu la data _(dd/mm/aaaa)_ o *avui*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return AF_DATA
-
-    data = _parse_data(text)
-    if not data:
-        await update.message.reply_text(
-            "⚠️ Format incorrecte. Usa *dd/mm/aaaa* o escriu *avui*.",
-            parse_mode="Markdown",
-            reply_markup=_keyboard_dates(),
-        )
-        return AF_DATA
-
-    context.user_data["data"] = data
-    await update.message.reply_text("🥖 Quin *producte*?", parse_mode="Markdown")
-    return AF_PRODUCTE
-
-
-async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    cerca_msg = await update.message.reply_text("🔍 Cercant producte...")
-    try:
-        resultats = await mcp.cercar_article(text)  # [{"c": codi, "n": nom}]
-    except Exception as e:
-        logger.warning(f"af_producte: cercar_article excepció: {e}")
-        resultats = []
-    fallback_used = False
-    if not resultats:
-        try:
-            fallback_options = await _fallback_article_options(text)
-            if fallback_options:
-                fallback_used = True
-                resultats = [{"n": name, "c": code} for name, code in fallback_options]
-                logger.info("af_producte: fallback cataleg per %r -> %s", text, fallback_options)
-        except Exception as e:
-            logger.warning("af_producte: fallback cataleg excepcio per %r: %s", text, e)
-    try:
-        await cerca_msg.delete()
-    except Exception:
-        pass
-
-    opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
-    logger.info(f"af_producte: {len(opcions)} opcions per '{text}': {opcions}")
-
-    if len(opcions) == 0:
-        await update.message.reply_text(
-            "❌ Producte no trobat. Prova amb un nom diferent:",
-            parse_mode="Markdown",
-        )
-        return AF_PRODUCTE
-
-    text_norm = _normalize_search_text(text)
-    coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
-
-    if len(coincidencies) == 1:
-        name, code = coincidencies[0]
-        context.user_data["producte"] = name
-        context.user_data["article_code"] = code
-        await update.message.reply_text(
-            f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?",
-            parse_mode="Markdown",
-        )
-        return AF_QUANTITAT
-
-    if len(opcions) == 1:
-        name, code = opcions[0]
-        context.user_data["producte"] = name
-        context.user_data["article_code"] = code
-        await update.message.reply_text(
-            f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?",
-            parse_mode="Markdown",
-        )
-        return AF_QUANTITAT
-
-    llista = coincidencies if len(coincidencies) > 1 else opcions
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del producte:",
-            parse_mode="Markdown",
-        )
-        return AF_PRODUCTE
-
-    context.user_data["article_opcions"] = {n: c for n, c in llista}
-    keyboard = [[n] for n, _ in llista]
-    keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
-    await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* productes {'semblants ' if fallback_used else ''}per «{text}».\nSelecciona el correcte:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return AF_PRODUCTE_OPCIO
-
-
-async def af_producte_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if "❌" in text or "cap d'aquests" in text.lower():
-        await update.message.reply_text(
-            "🥖 Torna a escriure el nom del *producte*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return AF_PRODUCTE
-
-    opcions = context.user_data.get("article_opcions", {})
-    code = opcions.get(text)
-    context.user_data["producte"] = text
-    context.user_data["article_code"] = code
-    await update.message.reply_text(
-        f"✅ Producte: *{text}*\n\n🔢 Quina *quantitat*?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return AF_QUANTITAT
-
-
-async def af_quantitat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = int(update.message.text.strip())
-        if q <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("⚠️ Introdueix un número enter positiu.")
-        return AF_QUANTITAT
-
-    context.user_data["quantitat"] = q
-    d = context.user_data
-
-    pending = {
-        "mode": "add",
-        "client_name": d["client"],
-        "client_code": d["client_code"],
-        "date_display": d["data"],
-        "date_mcp": _to_mcp_date(d["data"]),
-        "article_name": d["producte"],
-        "article_code": d["article_code"],
-        "quantity": q,
-        "fields": {"requested", "served"},
-    }
-    context.user_data["pending_order_edit"] = pending
-    logger.info(
-        "manual_order_prompt mode=add user=%s pending=%s fields=%s",
-        update.effective_user.id if update.effective_user else None,
-        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
-        sorted(pending["fields"]),
-    )
-    await update.message.reply_text(
-        _manual_order_text(pending),
-        parse_mode="Markdown",
-        reply_markup=_manual_order_keyboard(pending),
-    )
-    return ConversationHandler.END
-
-
-async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    reply_markup = ReplyKeyboardRemove()
-
-    if "❌" in text or "cancel" in text.lower():
-        await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
-        return ConversationHandler.END
-
-    encarreg = "encarreg" in text.lower()
-    order_type = 2 if encarreg else 1
-    d = context.user_data
-
-    client_code = d.get("client_code")
-    article_code = d.get("article_code")
-    if not client_code or not article_code:
-        await update.message.reply_text(
-            "❌ Error intern: no tinc els codis. Torna a iniciar /afegir.",
-            reply_markup=reply_markup,
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"⏳ {'Encarregant' if encarreg else 'Afegint'} *{d['producte']}* x{d['quantitat']} a *{d['client']}*...",
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-
-    data_mcp = _to_mcp_date(d["data"])
-    result = await mcp.afegir_linia_mcp(data_mcp, client_code, article_code, d["quantitat"], order_type)
-    ok = result.get("ok", False)
-    error = result.get("error", "Error desconegut")
-
-    if ok:
-        etiqueta = "Encarreg" if encarreg else "Afegit"
-        await update.message.reply_text(
-            f"✅ *{etiqueta} correctament!*\n\n"
-            f"👤 {d['client']}\n"
-            f"📅 {d['data']}\n"
-            f"🥖 {d['producte']} × {d['quantitat']}",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(f"❌ Error MCP: {error}")
-
-    return ConversationHandler.END
-
-
-# ================================================================== #
-#  FLUX: /veure                                                        #
-# ================================================================== #
-
-async def vr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    client_code, client_name = _bound_client(update)
-    if not _is_admin(update) and client_code:
-        context.user_data["client"] = client_name or f"codi {client_code}"
-        context.user_data["client_code"] = client_code
-        await update.message.reply_text(
-            f"🔍 *Veure albarà*\n\n👤 Client fixat: *{context.user_data['client']}*",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return await _demanar_data_veure(update)
-    await update.message.reply_text(
-        "🔍 *Veure albarà*\n\nQuin *client*?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return VR_CLIENT
-
-
-async def vr_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)
-    except Exception as e:
-        logger.warning(f"vr_client: cercar_client excepció: {e}")
-        resultats = []
-    try:
-        await cerca_msg.delete()
-    except Exception:
-        pass
-
-    opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
-    logger.info(f"vr_client: {len(opcions)} opcions per '{text}': {opcions}")
-
-    if len(opcions) == 0:
-        await update.message.reply_text(
-            "❌ Client no trobat. Prova amb un nom diferent:",
-            parse_mode="Markdown",
-        )
-        return VR_CLIENT
-
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-
-    if len(coincidencies) == 1:
-        name, code = coincidencies[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data_veure(update)
-
-    if len(opcions) == 1:
-        name, code = opcions[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data_veure(update)
-
-    llista = coincidencies if len(coincidencies) > 1 else opcions
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-            parse_mode="Markdown",
-        )
-        return VR_CLIENT
-
-    context.user_data["client_opcions"] = {n: c for n, c in llista}
-    keyboard = [[n] for n, _ in llista]
-    keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
-    await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* clients per «{text}».\nSelecciona el correcte:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return VR_CLIENT_OPCIO
-
-
-async def vr_client_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "❌" in text or "cap d'aquests" in text.lower():
-        await update.message.reply_text(
-            "👤 Torna a escriure el nom del *client*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return VR_CLIENT
-
-    opcions = context.user_data.get("client_opcions", {})
-    code = opcions.get(text)
-    context.user_data["client"] = text
-    context.user_data["client_code"] = code
-    await update.message.reply_text(
-        f"✅ Client: *{text}*", parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return await _demanar_data_veure(update)
-
-
-async def _demanar_data_veure(update: Update):
-    await update.message.reply_text(
-        "📅 Quina *data*?",
-        parse_mode="Markdown",
-        reply_markup=_keyboard_dates(),
-    )
-    return VR_DATA
-
-
-async def vr_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if "altra data" in text.lower():
-        await update.message.reply_text(
-            "✏️ Escriu la data _(dd/mm/aaaa)_ o *avui*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return VR_DATA
-
-    data = _parse_data(text)
-    if not data:
-        await update.message.reply_text(
-            "⚠️ Format incorrecte. Usa *dd/mm/aaaa* o escriu *avui*.",
-            parse_mode="Markdown",
-            reply_markup=_keyboard_dates(),
-        )
-        return VR_DATA
-
-    d = context.user_data
-    client_code = d.get("client_code")
-    client_name = d.get("client", "?")
-
-    if not client_code:
-        await update.message.reply_text("❌ No tinc el codi del client. Torna a iniciar /veure.")
-        return ConversationHandler.END
-
-    data_mcp = _to_mcp_date(data)
-    await update.message.reply_text(
-        f"⏳ Carregant albarà de *{client_name}* ({data})...",
-        parse_mode="Markdown",
-    )
-
-    result = await mcp.veure_comanda(data_mcp, client_code)
-
-    if "error" in result:
-        await update.message.reply_text(f"❌ Error: {result['error']}")
-    else:
-        lines = result.get("order", [])
-        ticket = _format_order_ticket(client_name, data, lines)
-        if ticket:
-            await update.message.reply_text(
-                ticket,
-                parse_mode="HTML",
-            )
-        else:
-            await update.message.reply_text(
-                f"ℹ️ No hi ha línies per *{client_name}* el {data}.",
-                parse_mode="Markdown",
-            )
-
-    return ConversationHandler.END
-
-
-# ================================================================== #
-#  FLUX: /esborrar                                                     #
-# ================================================================== #
-
-async def eb_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    client_code, client_name = _bound_client(update)
-    if not _is_admin(update) and client_code:
-        context.user_data["client"] = client_name or f"codi {client_code}"
-        context.user_data["client_code"] = client_code
-        await update.message.reply_text(
-            f"🗑️ *Esborrar línia de comanda*\n\n👤 Client fixat: *{context.user_data['client']}*",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return await _demanar_data_eb(update)
-    await update.message.reply_text(
-        "🗑️ *Esborrar línia de comanda*\n\nQuin *client*?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return EB_CLIENT
-
-
-async def eb_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)
-    except Exception as e:
-        logger.warning(f"eb_client: cercar_client excepció: {e}")
-        resultats = []
-    try:
-        await cerca_msg.delete()
-    except Exception:
-        pass
-
-    opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
-
-    if len(opcions) == 0:
-        await update.message.reply_text("❌ Client no trobat. Prova amb un nom diferent:")
-        return EB_CLIENT
-
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-    llista = coincidencies if len(coincidencies) >= 1 else opcions
-
-    if len(llista) == 1:
-        name, code = llista[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data_eb(update)
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:"
-        )
-        return EB_CLIENT
-
-    context.user_data["client_opcions"] = {n: c for n, c in llista}
-    keyboard = [[n] for n, _ in llista]
-    keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
-    await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* clients per «{text}».\nSelecciona el correcte:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return EB_CLIENT_OPCIO
-
-
-async def eb_client_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "❌" in text or "cap d'aquests" in text.lower():
-        await update.message.reply_text(
-            "👤 Torna a escriure el nom del *client*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return EB_CLIENT
-
-    opcions = context.user_data.get("client_opcions", {})
-    context.user_data["client"] = text
-    context.user_data["client_code"] = opcions.get(text)
-    await update.message.reply_text(f"✅ Client: *{text}*", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    return await _demanar_data_eb(update)
-
-
-async def _demanar_data_eb(update: Update):
-    await update.message.reply_text("📅 Quina *data*?", parse_mode="Markdown", reply_markup=_keyboard_dates())
-    return EB_DATA
-
-
-async def eb_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if "altra data" in text.lower():
-        await update.message.reply_text(
-            "✏️ Escriu la data _(dd/mm/aaaa)_ o *avui*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return EB_DATA
-
-    data = _parse_data(text)
-    if not data:
-        await update.message.reply_text(
-            "⚠️ Format incorrecte. Usa *dd/mm/aaaa* o escriu *avui*.",
-            parse_mode="Markdown",
-            reply_markup=_keyboard_dates(),
-        )
-        return EB_DATA
-
-    context.user_data["data"] = data
-    await update.message.reply_text("🥖 Quin *producte* vols esborrar?", parse_mode="Markdown")
-    return EB_PRODUCTE
-
-
-async def eb_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    cerca_msg = await update.message.reply_text("🔍 Cercant producte...")
-    try:
-        resultats = await mcp.cercar_article(text)
-    except Exception as e:
-        logger.warning(f"eb_producte: cercar_article excepció: {e}")
-        resultats = []
-    try:
-        await cerca_msg.delete()
-    except Exception:
-        pass
-
-    opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
-
-    if len(opcions) == 0:
-        await update.message.reply_text("❌ Producte no trobat. Prova amb un nom diferent:")
-        return EB_PRODUCTE
-
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-    llista = coincidencies if len(coincidencies) >= 1 else opcions
-
-    if len(llista) == 1:
-        name, code = llista[0]
-        context.user_data["producte"] = name
-        context.user_data["article_code"] = code
-        return await _confirmar_esborrar(update, context)
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del producte:"
-        )
-        return EB_PRODUCTE
-
-    context.user_data["article_opcions"] = {n: c for n, c in llista}
-    keyboard = [[n] for n, _ in llista]
-    keyboard.append(["❌ Cap d'aquests (tornar a escriure)"])
-    await update.message.reply_text(
-        f"🔍 He trobat *{len(llista)}* productes per «{text}».\nSelecciona el correcte:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return EB_PRODUCTE_OPCIO
-
-
-async def eb_producte_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if "❌" in text or "cap d'aquests" in text.lower():
-        await update.message.reply_text(
-            "🥖 Torna a escriure el nom del *producte*:",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return EB_PRODUCTE
-
-    opcions = context.user_data.get("article_opcions", {})
-    context.user_data["producte"] = text
-    context.user_data["article_code"] = opcions.get(text)
-    await update.message.reply_text(f"✅ Producte: *{text}*", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    return await _confirmar_esborrar(update, context)
-
-
-async def _confirmar_esborrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = context.user_data
-    pending = {
-        "mode": "delete",
-        "client_name": d["client"],
-        "client_code": d["client_code"],
-        "date_display": d["data"],
-        "date_mcp": _to_mcp_date(d["data"]),
-        "article_name": d["producte"],
-        "article_code": d["article_code"],
-        "quantity": 0,
-        "fields": {"requested", "served", "returned"},
-    }
-    context.user_data["pending_order_edit"] = pending
-    logger.info(
-        "manual_order_prompt mode=delete user=%s pending=%s fields=%s",
-        update.effective_user.id if update.effective_user else None,
-        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
-        sorted(pending["fields"]),
-    )
-    await update.message.reply_text(
-        _manual_order_text(pending),
-        parse_mode="Markdown",
-        reply_markup=_manual_order_keyboard(pending),
-    )
-    return ConversationHandler.END
-
-
-async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    reply_markup = ReplyKeyboardRemove()
-
-    if "❌" in text or "cancel" in text.lower():
-        await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
-        return ConversationHandler.END
-
-    d = context.user_data
-    client_code = d.get("client_code")
-    article_code = d.get("article_code")
-
-    if not client_code or not article_code:
-        await update.message.reply_text("❌ Error intern: no tinc els codis. Torna a iniciar /esborrar.", reply_markup=reply_markup)
-        return ConversationHandler.END
-
-    estat_msg = await update.message.reply_text(
-        f"⏳ Esborrant *{d['producte']}* de *{d['client']}*...",
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
-    )
-
-    data_mcp = _to_mcp_date(d["data"])
-    result = await mcp.afegir_linia_mcp(data_mcp, client_code, article_code, 0, 1)
-    ok = result.get("ok", False)
-
-    await _tancar_estat(estat_msg)
-
-    if ok:
-        await update.message.reply_text(
-            f"🗑️ *Esborrat correctament*\n\n"
-            f"👤 {d['client']}\n"
-            f"📅 {d['data']}\n"
-            f"🥖 {d['producte']} → 0",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
-
-    return ConversationHandler.END
-
-
-# ================================================================== #
-#  /vendes                                                             #
-# ================================================================== #
-
-async def cmd_vendes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el flux interactiu d'informes de vendes."""
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return ConversationHandler.END
-    if not _is_admin(update):
-        await update.message.reply_text("❌ Aquesta informació només està disponible per a usuaris administratius.")
-        return ConversationHandler.END
-
-    context.user_data["vendes"] = {}
-    buttons = [["Granollers", "Montornès"], ["✏️ Codi botiga manual"], ["❌ Cancel·lar"]]
-    await update.message.reply_text(
-        "📊 De quina botiga vols l'informe?",
-        reply_markup=ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return VD_SHOP
-
-
-async def vd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("❌"):
-        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    normalized = _normalize_search_text(text)
-    if normalized == "granollers":
-        shop_code, shop_name = int(config.SHOPS["granollers"]), "Granollers"
-    elif normalized in {"montornes", "montornès"}:
-        shop_code, shop_name = int(config.SHOPS["montornes"]), "Montornès"
-    else:
-        match = re.search(r"\d+", text)
-        if not match:
-            await update.message.reply_text("Escriu el codi de botiga o tria una opció.")
-            return VD_SHOP
-        shop_code = int(match.group(0))
-        shop_name = f"Botiga {shop_code}"
-
-    context.user_data["vendes"] = {"shop_code": shop_code, "shop_name": shop_name}
-    await update.message.reply_text("📅 Tria la data:", reply_markup=_keyboard_sales_dates())
-    return VD_DATE
-
-
-async def vd_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("❌"):
-        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    if "data lliure" in _normalize_search_text(text):
-        await update.message.reply_text("✏️ Escriu la data de vendes en format dd/mm/aaaa:", reply_markup=ReplyKeyboardRemove())
-        return VD_DATE
-
-    parsed = _parse_sales_date(text)
-    if not parsed:
-        await update.message.reply_text("⚠️ Data no vàlida. Escriu-la com dd/mm/aaaa.")
-        return VD_DATE
-
-    data_mcp, data_display = parsed
-    context.user_data.setdefault("vendes", {}).update({"data_mcp": data_mcp, "data_display": data_display})
-    buttons = [
-        ["📊 Resum vendes"],
-        ["🕒 Productes per hora"],
-        ["🥖 Productes total dia"],
-        ["🎉 Hora Feliz"],
-        ["❌ Cancel·lar"],
-    ]
-    await update.message.reply_text(
-        "Quin informe vols?",
-        reply_markup=ReplyKeyboardMarkup(buttons, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return VD_REPORT
-
-
-async def vd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("❌"):
-        await update.message.reply_text("Cancel·lat.", reply_markup=ReplyKeyboardRemove())
-        return ConversationHandler.END
-
-    data = context.user_data.get("vendes", {})
-    shop_code = int(data["shop_code"])
-    shop_name = data["shop_name"]
-    data_mcp = data["data_mcp"]
-    data_display = data["data_display"]
-    normalized = _normalize_search_text(text)
-
-    estat_msg = await update.message.reply_text(
-        f"📊 Carregant informe de {shop_name} ({data_display})...",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    try:
-        if "hora feliz" in normalized:
-            detail = await mcp.detall_tickets_dia(shop_code, data_mcp, limit=1000, offset=0)
-            if detail.get("error"):
-                await estat_msg.edit_text(f"❌ Error MCP: {detail['error']}")
-                return ConversationHandler.END
-            report = _format_hora_feliz_report(detail, shop_name, data_display)
-        else:
-            r = await mcp.vendes_dia(shop_code, data_mcp)
-            if not r.get("v"):
-                await estat_msg.edit_text(f"ℹ️ Sense dades de vendes per {shop_name} el {data_display}.")
-                return ConversationHandler.END
-            if "hora" in normalized:
-                report = _format_products_by_hour_report(r, shop_name, data_display)
-            elif "product" in normalized or "total dia" in normalized:
-                report = _format_product_totals_report(r, shop_name, data_display)
-            else:
-                report = _format_sales_summary_report(r, shop_name, data_display)
-    except Exception as e:
-        logger.exception("Error carregant informe de vendes")
-        await estat_msg.edit_text(f"❌ Error MCP: {e}")
-        return ConversationHandler.END
-
-    await estat_msg.delete()
-    await _send_chunks(update.message, report, parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-# ================================================================== #
-#  IA: Gemini (text lliure i àudio)                                    #
-# ================================================================== #
-
-# ================================================================== #
-#  /imprimir — Impressió d'albarans amb còpies per client             #
-# ================================================================== #
-
-async def im_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autoritzat(update):
-        await rebuig(update, context)
-        return ConversationHandler.END
-    if context.args:
-        inline_text = " ".join(context.args).strip()
-        print_text = _extract_print_text(f"imprimir {inline_text}")
-        if print_text is not None:
-            await _send_print_text(update, print_text)
-            return ConversationHandler.END
-    context.user_data.pop("im_data", None)
-    context.user_data.pop("im_client", None)
-    context.user_data.pop("im_clients_impresos", None)
-    await update.message.reply_text(
-        "🖨️ *Impressió*\n\nQue vols imprimir?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(
-            [["📋 Albarans"], ["✏️ Text lliure"]],
-            one_time_keyboard=True, resize_keyboard=True,
-        ),
-    )
-    return IM_TIPUS
-
-
-async def im_tipus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "Text lliure" in text:
-        await update.message.reply_text(
-            "✏️ Escriu el text que vols imprimir:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return IM_TEXT
-    await update.message.reply_text(
-        "📋 *Albarans* — Quina data?",
-        parse_mode="Markdown",
-        reply_markup=_keyboard_dates(),
-    )
-    return IM_DATA
-
-
-async def im_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    await _send_print_text(update, text)
-    return ConversationHandler.END
-
-
-async def im_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = _parse_data(update.message.text.strip())
-    if not data:
-        await update.message.reply_text("⚠️ Data no vàlida. Escriu DD/MM/AAAA o tria un botó.")
-        return IM_DATA
-    context.user_data["im_data"] = data
-    context.user_data["im_clients_impresos"] = []
-    await update.message.reply_text(
-        f"📅 Data: *{data}*\n\nImprimeixo tots els clients o un de concret?",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(
-            [["🖨️ Tots els clients"], ["👤 Un client concret"]],
-            one_time_keyboard=True, resize_keyboard=True,
-        ),
-    )
-    return IM_CLIENT
-
-
-async def im_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "Tots els clients" in text:
-        data = context.user_data["im_data"]
-        await _print_all_orders(update, data)
-        return ConversationHandler.END
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    resultats = await mcp.cercar_client(text)
-    if not resultats:
-        await update.message.reply_text("❌ Client no trobat. Torna a intentar-ho:")
-        return IM_CLIENT
-    if len(resultats) == 1:
-        c = resultats[0]
-        context.user_data["im_client"] = {"codi": c["c"], "nom": c["n"]}
-        copies = _get_copies(c["c"])
-        return await _im_imprimir(update, context, copies)
-    # Múltiples resultats
-    botons = [[r["n"]] for r in resultats[:10]]
-    context.user_data["im_resultats"] = resultats[:10]
-    await update.message.reply_text(
-        "Quin client?",
-        reply_markup=ReplyKeyboardMarkup(botons, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return IM_CLIENT_OPCIO
-
-
-async def im_client_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    resultats = context.user_data.get("im_resultats", [])
-    trobat = next((r for r in resultats if r["n"] == text), None)
-    if not trobat:
-        await update.message.reply_text("⚠️ Tria una opció de la llista:")
-        return IM_CLIENT_OPCIO
-    context.user_data["im_client"] = {"codi": trobat["c"], "nom": trobat["n"]}
-    copies = _get_copies(trobat["c"])
-    return await _im_imprimir(update, context, copies)
-
-
-async def _im_imprimir(update: Update, context: ContextTypes.DEFAULT_TYPE, copies: int) -> int:
-    """Obté la comanda del MCP i imprimeix directament a la impressora Star."""
-    client = context.user_data["im_client"]
-    data = context.user_data["im_data"]
-    data_mcp = _to_mcp_date(data)
-
-    estat_msg = await update.message.reply_text(
-        f"🖨️ Imprimint {copies} còpia(es) de *{client['nom']}*...",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-    r = await mcp.imprimir_albarans(data_mcp, client["codi"], copies)
-    errors = 1 if "error" in r else 0
-
-    impresos = context.user_data.setdefault("im_clients_impresos", [])
-    impresos.append(f"{client['nom']} ×{copies}")
-
-    try:
-        if errors:
-            await estat_msg.edit_text(f"⚠️ {client['nom']}: error d'impressió.")
-        else:
-            await estat_msg.edit_text(
-                f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
-                parse_mode="Markdown",
-                reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
-            )
-    except Exception:
-        if errors:
-            await update.message.reply_text(f"⚠️ {client['nom']}: error d'impressió.")
-        else:
-            await update.message.reply_text(
-                f"✅ *{client['nom']}* — {copies} còpia(es) en cua.\n\nVols imprimir un altre client?",
-                parse_mode="Markdown",
-                reply_markup=ReplyKeyboardMarkup([["✅ Sí, un altre", "🏁 Acabar"]], one_time_keyboard=True, resize_keyboard=True),
-            )
-    return IM_SEGUENT
-
-
-async def im_copies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        copies = int(text)
-        if copies < 1 or copies > 10:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("⚠️ Escriu un número entre 1 i 10:")
-        return IM_COPIES
-    return await _im_imprimir(update, context, copies)
-
-
-async def im_seguent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if "Sí" in text or "si" in text.lower():
-        await update.message.reply_text(
-            "Escriu el nom del client:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return IM_CLIENT
-
-    impresos = context.user_data.get("im_clients_impresos", [])
-    resum = "\n".join(f"• {x}" for x in impresos) if impresos else "—"
-    await update.message.reply_text(
-        f"🖨️ *Impressió completada*\n\n{resum}",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ConversationHandler.END
 
 
 # ================================================================== #
@@ -3110,193 +1509,9 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ------------------------------------------------------------------ #
-#  Auto enviament programat                                            #
-# ------------------------------------------------------------------ #
-
-async def _notify_auto_all_users(bot: Bot, text: str):
-    """Envia un missatge a tots els usuaris autoritzats (admin + usuaris)."""
-    auth_data = _load_auth_data()
-    user_ids = set(auth_data.get("authorized_users", []))
-    admin_id = _get_admin_user_id()
-    if admin_id:
-        user_ids.add(admin_id)
-    for uid in user_ids:
-        try:
-            await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
-        except Exception as e:
-            logger.warning("No s'ha pogut notificar l'usuari %s: %s", uid, e)
-
-
-def _auto_envia_state_path(data_mcp: str) -> Path:
-    return AUTO_ENVIA_STATE_DIR / f"{data_mcp}.json"
-
-
-def _read_auto_envia_state(data_mcp: str) -> dict | None:
-    path = _auto_envia_state_path(data_mcp)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Auto enviament: no puc llegir estat %s: %s", path, exc)
-        return {"status": "unknown", "path": str(path)}
-
-
-def _write_auto_envia_state(data_mcp: str, state: dict) -> None:
-    AUTO_ENVIA_STATE_DIR.mkdir(exist_ok=True)
-    path = _auto_envia_state_path(data_mcp)
-    payload = {**state, "date": data_mcp, "updated_at": datetime.now().isoformat(timespec="seconds")}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _claim_auto_envia_run(data_mcp: str) -> bool:
-    AUTO_ENVIA_STATE_DIR.mkdir(exist_ok=True)
-    path = _auto_envia_state_path(data_mcp)
-    now = datetime.now()
-    payload = {
-        "date": data_mcp,
-        "status": "running",
-        "started_at": now.isoformat(timespec="seconds"),
-        "updated_at": now.isoformat(timespec="seconds"),
-    }
-    try:
-        with path.open("x", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        return True
-    except FileExistsError:
-        state = _read_auto_envia_state(data_mcp) or {}
-        status = state.get("status")
-        if status == "success":
-            logger.info("Auto enviament: %s ja consta enviat correctament, saltant", data_mcp)
-            return False
-        if status == "running":
-            started_raw = state.get("started_at") or state.get("updated_at")
-            try:
-                started = datetime.fromisoformat(started_raw) if started_raw else now
-            except ValueError:
-                started = now
-            if now - started < timedelta(hours=2):
-                logger.warning("Auto enviament: %s ja s'està executant, saltant duplicat", data_mcp)
-                return False
-            logger.warning("Auto enviament: estat running antic per %s, reintentant", data_mcp)
-        else:
-            logger.info("Auto enviament: estat anterior %s per %s, reintentant", status, data_mcp)
-        _write_auto_envia_state(data_mcp, payload)
-        return True
-
-
-def _mark_auto_envia_success(data_mcp: str, *, clients: int, copies: int) -> None:
-    _write_auto_envia_state(data_mcp, {"status": "success", "clients": clients, "copies": copies})
-
-
-def _mark_auto_envia_failed(data_mcp: str, error: str) -> None:
-    _write_auto_envia_state(data_mcp, {"status": "failed", "error": error})
-
-
 async def auto_envia_comandes():
     """Executa una passada d'autoenviament per ser cridada des d'un cron extern."""
-    async with Bot(token=config.TELEGRAM_TOKEN) as bot:
-        await _run_auto_envia_comandes(bot)
-
-
-async def _run_auto_envia_comandes(bot: Bot):
-    dema = date.today() + timedelta(days=1)
-    data_display = dema.strftime("%d/%m/%Y")
-    data_mcp = dema.strftime("%Y-%m-%d")
-
-    logger.info("Auto enviament: iniciant per al %s", data_display)
-
-    if not _claim_auto_envia_run(data_mcp):
-        return
-
-    try:
-        resultat = await mcp.comandes_per_data(data_mcp)
-    except Exception as e:
-        logger.exception("Auto enviament: error MCP per al %s", data_display)
-        _mark_auto_envia_failed(data_mcp, str(e))
-        await _notify_auto_all_users(bot, f"❌ Error auto enviament del {escape(data_display)}: {escape(str(e))}")
-        return
-
-    clients = resultat.get("clients", [])
-    if not clients:
-        msg = f"ℹ️ Auto enviament: no hi ha comandes per al {escape(data_display)}."
-        logger.info(msg)
-        _mark_auto_envia_success(data_mcp, clients=0, copies=0)
-        await _notify_auto_all_users(bot, msg)
-        return
-
-    impresos: list[str] = []
-    errors: list[str] = []
-    total_copies = 0
-    totals_articles: dict[str, int] = {}
-
-    for client in clients:
-        codi = client.get("codi")
-        nom = client.get("nom", str(codi))
-        if not codi:
-            continue
-
-        copies = _get_copies(int(codi))
-        logger.info("Auto enviament: imprimint date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
-        try:
-            result = await mcp.imprimir_albarans(data_mcp, int(codi), copies)
-            if "error" in result:
-                logger.warning("Auto enviament error: date=%s client=%s: %s", data_mcp, codi, result)
-                errors.append(f"{nom}: error")
-            else:
-                impresos.append(f"{nom} x{copies}")
-                total_copies += copies
-                for linia in client.get("linies", []):
-                    nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
-                    qty = linia.get("requested", 0)
-                    if qty > 0:
-                        totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
-        except Exception as e:
-            logger.exception("Auto enviament excepcio: client=%s", codi)
-            errors.append(f"{nom}: {e}")
-
-    totals_lines = sorted(totals_articles.items(), key=lambda x: x[0].lower())
-    totals_txt = ""
-    if totals_lines:
-        totals_txt = "\n\n<b>Resum productes:</b>\n" + "\n".join(
-            f"• {escape(art)}: {qty}" for art, qty in totals_lines
-        )
-
-    if errors:
-        summary = (
-            "⚠️ <b>Comandes enviades amb errors.</b>\n\n"
-            f"📅 {escape(data_display)}\n"
-            f"Clients enviats: {len(impresos)}\n"
-            f"Còpies totals: {total_copies}\n\n"
-            "<b>Clients enviats:</b>\n"
-            + ("\n".join(f"• {item}" for item in impresos[:25]) if impresos else "- Cap")
-            + "\n\n<b>Errors:</b>\n"
-            + "\n".join(f"• {e}" for e in errors[:10])
-            + totals_txt
-        )
-    else:
-        summary = (
-            "✅ <b>Comandes enviades automàticament.</b>\n\n"
-            f"📅 {escape(data_display)}\n"
-            f"Clients: {len(impresos)}\n"
-            f"Còpies totals: {total_copies}\n\n"
-            "<b>Clients enviats:</b>\n"
-            + "\n".join(f"• {item}" for item in impresos[:25])
-            + totals_txt
-        )
-
-    logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
-    if errors:
-        _mark_auto_envia_failed(data_mcp, "; ".join(errors[:10]))
-    else:
-        _mark_auto_envia_success(data_mcp, clients=len(impresos), copies=total_copies)
-    await _notify_auto_all_users(bot, summary)
-
-    if totals_lines:
-        totals_dict = {art: qty for art, qty in totals_lines}
-        text_escpos = _format_totals_escpos(data_display, totals_dict, len(impresos))
-        await imprimir_text_directe(text_escpos)
+    await auto_sender.run_with_new_bot()
 
 
 # ------------------------------------------------------------------ #
@@ -3320,92 +1535,157 @@ def run_bot():
     stop_filter = filters.TEXT & filters.Regex(r"(?i)^stop$")
     stop_handler_msg = MessageHandler(stop_filter, cmd_stop)
 
-    # Flux /afegir
-    afegir_handler = ConversationHandler(
-        entry_points=[CommandHandler("afegir", af_start)],
-        states={
-            AF_CLIENT:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_client)],
-            AF_CLIENT_OPCIO:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_client_opcio)],
-            AF_DATA:           [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_data)],
-            AF_PRODUCTE:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte)],
-            AF_PRODUCTE_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_producte_opcio)],
-            AF_QUANTITAT:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_quantitat)],
-            AF_CONFIRMAR:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, af_confirmar)],
-        },
-        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    afegir_handler = build_afegir_handler(
+        logger=logger,
+        mcp=mcp,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        is_admin=_is_admin,
+        bound_client=_bound_client,
+        keyboard_dates=_keyboard_dates,
+        parse_data=_parse_data,
+        to_mcp_date=_to_mcp_date,
+        normalize_search_text=_normalize_search_text,
+        fallback_article_options=_fallback_article_options,
+        manual_order_text=_manual_order_text,
+        manual_order_keyboard=_manual_order_keyboard,
+        cmd_stop=cmd_stop,
+        cmd_cancel=cmd_cancel,
     )
 
-    # Flux /veure
-    veure_handler = ConversationHandler(
-        entry_points=[CommandHandler("veure", vr_start)],
-        states={
-            VR_CLIENT:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client)],
-            VR_CLIENT_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_client_opcio)],
-            VR_DATA:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vr_data)],
-        },
-        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    veure_handler = build_veure_handler(
+        logger=logger,
+        mcp=mcp,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        is_admin=_is_admin,
+        bound_client=_bound_client,
+        keyboard_dates=_keyboard_dates,
+        parse_data=_parse_data,
+        to_mcp_date=_to_mcp_date,
+        format_order_ticket=_format_order_ticket,
+        cmd_stop=cmd_stop,
+        cmd_cancel=cmd_cancel,
     )
 
-    # Flux /esborrar
-    esborrar_handler = ConversationHandler(
-        entry_points=[CommandHandler("esborrar", eb_start)],
-        states={
-            EB_CLIENT:        [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client)],
-            EB_CLIENT_OPCIO:  [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_client_opcio)],
-            EB_DATA:          [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_data)],
-            EB_PRODUCTE:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte)],
-            EB_PRODUCTE_OPCIO:[stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte_opcio)],
-            EB_CONFIRMAR:     [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_confirmar)],
-        },
-        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    esborrar_handler = build_esborrar_handler(
+        logger=logger,
+        mcp=mcp,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        is_admin=_is_admin,
+        bound_client=_bound_client,
+        keyboard_dates=_keyboard_dates,
+        parse_data=_parse_data,
+        to_mcp_date=_to_mcp_date,
+        manual_order_text=_manual_order_text,
+        manual_order_keyboard=_manual_order_keyboard,
+        tancar_estat=_tancar_estat,
+        cmd_stop=cmd_stop,
+        cmd_cancel=cmd_cancel,
     )
 
-    # Flux /imprimir
-    imprimir_handler = ConversationHandler(
-        entry_points=[CommandHandler("imprimir", im_start)],
-        states={
-            IM_TIPUS:        [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_tipus)],
-            IM_DATA:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_data)],
-            IM_CLIENT:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client)],
-            IM_CLIENT_OPCIO: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_client_opcio)],
-            IM_COPIES:       [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_copies)],
-            IM_SEGUENT:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_seguent)],
-            IM_TEXT:         [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, im_text)],
-        },
-        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    imprimir_handler = build_imprimir_handler(
+        mcp=mcp,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        keyboard_dates=_keyboard_dates,
+        parse_data=_parse_data,
+        to_mcp_date=_to_mcp_date,
+        get_copies=_get_copies,
+        print_all_orders=_print_all_orders,
+        extract_print_text=_extract_print_text,
+        send_print_text=_send_print_text,
+        cmd_stop=cmd_stop,
+        cmd_cancel=cmd_cancel,
     )
 
-    # Flux /vendes
-    vendes_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("vendes", cmd_vendes),
-            MessageHandler(filters.TEXT & filters.Regex(r"(?i)^\s*(vendes|ventas|ventes)\s*$"), cmd_vendes),
-        ],
-        states={
-            VD_SHOP:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_shop)],
-            VD_DATE:   [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_date)],
-            VD_REPORT: [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, vd_report)],
-        },
-        fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],
+    vendes_handler = build_vendes_handler(
+        logger=logger,
+        mcp=mcp,
+        shops=config.SHOPS,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        is_admin=_is_admin,
+        normalize_search_text=_normalize_search_text,
+        keyboard_sales_dates=_keyboard_sales_dates,
+        parse_sales_date=_parse_sales_date,
+        format_hora_feliz_report=_format_hora_feliz_report,
+        format_products_by_hour_report=_format_products_by_hour_report,
+        format_product_totals_report=_format_product_totals_report,
+        format_sales_summary_report=_format_sales_summary_report,
+        send_chunks=_send_chunks,
+        cmd_stop=cmd_stop,
+        cmd_cancel=cmd_cancel,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_start))
+    app.add_handler(CommandHandler("hora", cmd_hora))
     app.add_handler(CommandHandler("imprimir_text", cmd_imprimir_text))
     app.add_handler(CommandHandler("cua_impressio", cmd_cua_impressio))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    register_ia_admin_handlers(app, _get_admin_user_id, mcp=mcp, get_copies=_get_copies)
     app.add_handler(afegir_handler)
     app.add_handler(esborrar_handler)
     app.add_handler(veure_handler)
     app.add_handler(imprimir_handler)
     app.add_handler(vendes_handler)
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact_share))
-    app.add_handler(MessageHandler(filters.VOICE, ai_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_text))
+    register_ai_chat_handlers(
+        app,
+        ai=ai,
+        mcp=mcp,
+        logger=logger,
+        autoritzat=autoritzat,
+        rebuig=rebuig,
+        is_admin=_is_admin,
+        bound_client=_bound_client,
+        deny_scope=_deny_scope,
+        cmd_hora=cmd_hora,
+        send_chunks=_send_chunks,
+        tancar_estat=_tancar_estat,
+        send_hourly_sales_report=_send_hourly_sales_report,
+        is_print_queue_request=_is_print_queue_request,
+        format_print_queue=_format_print_queue,
+        extract_print_text=_extract_print_text,
+        send_print_text=_send_print_text,
+        is_all_orders_request=_is_all_orders_request,
+        is_print_request=_is_print_request,
+        is_product_summary_excel_request=_is_product_summary_excel_request,
+        parse_all_orders_date=_parse_all_orders_date,
+        print_all_orders=_print_all_orders,
+        send_product_summary_excel=_send_product_summary_excel,
+        to_mcp_date=_to_mcp_date,
+        format_all_orders_blocks=_format_all_orders_blocks,
+        send_html_blocks=_send_html_blocks,
+        is_simple_greeting=_is_simple_greeting,
+        save_pending_selection=_save_pending_selection,
+        pending_polls=_pending_polls,
+        clear_pending_selection=_clear_pending_selection,
+        initial_confirmation_fields=_initial_confirmation_fields,
+        confirmation_text=_confirmation_text,
+        confirmation_keyboard=_confirmation_keyboard,
+    )
 
-    from telegram.ext import PollAnswerHandler, CallbackQueryHandler as TGCallbackQueryHandler
-    app.add_handler(TGCallbackQueryHandler(handle_callback_query))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
+    register_callback_handlers(
+        app,
+        logger=logger,
+        mcp=mcp,
+        ai=ai,
+        order_field_labels=ORDER_FIELD_LABELS,
+        order_field_kwargs=ORDER_FIELD_KWARGS,
+        manual_order_text=_manual_order_text,
+        manual_order_keyboard=_manual_order_keyboard,
+        order_type_choice_keyboard=_order_type_choice_keyboard,
+        format_order_fields=_format_order_fields,
+        confirmation_text=_confirmation_text,
+        confirmation_keyboard=_confirmation_keyboard,
+        format_order_ticket=_format_order_ticket,
+        load_auth_data=_load_auth_data,
+        save_auth_data=_save_auth_data,
+        get_admin_user_id=_get_admin_user_id,
+        base_dir=Path(__file__).resolve().parent,
+    )
     app.add_error_handler(error_handler)
 
     logger.info("=" * 50)
