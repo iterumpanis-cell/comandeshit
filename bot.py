@@ -326,13 +326,15 @@ def _confirmation_text(lines: list, fields) -> str:
     text_lines = ["📋 *Confirmes la comanda?*\n"]
     for line in lines:
         date_fmt = line.get("date", "?")
-        client_name = line.get("client_name", f"codi {line.get('client', '?')}")
+        client_code = line.get("client", "?")
+        client_name = line.get("client_name") or "Client sense validar"
+        client_label = f"{client_name} ({client_code})" if client_code != "?" else client_name
         article_name = line.get("article_name", f"codi {line.get('article_code', '?')}")
         qty = line.get("quantity", 0)
         order_type = line.get("order_type", 1)
         prefix = "🎗️ " if order_type == 2 else "🥖 "
         text_lines.append(f"{prefix}*{article_name}* × {qty}")
-        text_lines.append(f"   👤 {client_name}  📅 {date_fmt}")
+        text_lines.append(f"   👤 {client_label}  📅 {date_fmt}")
     text_lines.append(f"\n📌 Camps: *{_format_order_fields(fields)}*")
     return "\n".join(text_lines)
 
@@ -2165,6 +2167,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         for line in lines:
             try:
+                if not line.get("client_validated"):
+                    errors.append(
+                        f"❌ {line.get('article_name', '?')}: client no validat per MCP. "
+                        "No escric res per evitar equivocar el client."
+                    )
+                    logger.warning(
+                        "confirm_apply bloquejat: client no validat user=%s line=%s",
+                        query.from_user.id,
+                        {k: line.get(k) for k in ("date", "client", "client_name", "article_code", "quantity", "order_type")},
+                    )
+                    continue
                 order_type = forced_order_type if forced_order_type in (1, 2) else line.get("order_type", 1)
                 logger.info(
                     "confirm_apply user=%s order_type=%s fields=%s line=%s",
@@ -3537,8 +3550,6 @@ async def auto_envia_comandes():
 def _auto_envia_dins_finestra_cron(now: datetime | None = None) -> bool:
     """Evita que PM2 executi l'enviament nomes per arrencar o resurrectar l'app."""
     now = now or datetime.now()
-    if now.weekday() < 5:
-        return now.hour == 18 and now.minute <= 10
     return now.hour == 13 and now.minute <= 10
 
 

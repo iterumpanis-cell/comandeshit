@@ -770,6 +770,80 @@ class GeminiHitAssistant:
             for text, r in zip(texts, results)
         }
 
+    @staticmethod
+    def _normalize_client_name(text: str) -> str:
+        text = unicodedata.normalize("NFKD", str(text or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        text = re.sub(r"[^a-zA-Z0-9]+", " ", text).strip().lower()
+        return re.sub(r"\s+", " ", text)
+
+    async def _validate_order_client(self, client: int, client_name: str) -> dict:
+        """Validate that the AI-proposed client code matches the written client name."""
+        clean_name = str(client_name or "").strip()
+        if not clean_name or clean_name == "?" or clean_name.lower().startswith("codi "):
+            return {
+                "ok": False,
+                "error": (
+                    "No puc validar el client de la comanda. Escriu el nom del client i torna-ho a provar "
+                    "(exemple: Cal Cabre), o selecciona'l quan el bot t'ho demani."
+                ),
+            }
+
+        expected = self._normalize_client_name(clean_name)
+        matches = await self.mcp.cercar_client(clean_name)
+        if not matches:
+            all_clients = await self.mcp.llistar_tots_clients()
+            expected_norm = self._normalize_client_name(clean_name)
+            matches = [
+                item for item in all_clients or []
+                if self._normalize_client_name(item.get("n")) == expected_norm
+            ]
+        exact_matches = []
+        for match in matches or []:
+            try:
+                match_code = int(match.get("c"))
+            except (TypeError, ValueError):
+                continue
+            match_name = str(match.get("n") or "").strip()
+            normalized = self._normalize_client_name(match_name)
+            if normalized == expected:
+                exact_matches.append({"c": match_code, "n": match_name})
+
+        candidates = exact_matches or [
+            {"c": int(match.get("c")), "n": str(match.get("n") or "").strip()}
+            for match in (matches or [])
+            if str(match.get("c", "")).lstrip("-").isdigit()
+        ]
+
+        if not candidates:
+            return {
+                "ok": False,
+                "error": f"No he pogut trobar cap client a HIT que coincideixi amb '{clean_name}'. No escric res.",
+            }
+
+        matching_code = [c for c in candidates if int(c["c"]) == int(client)]
+        if len(candidates) == 1 and not matching_code:
+            found = candidates[0]
+            return {
+                "ok": False,
+                "error": (
+                    f"Client bloquejat: has indicat '{clean_name}', que a HIT correspon a "
+                    f"{found['n']} ({found['c']}), però la IA volia escriure al codi {client}. No escric res."
+                ),
+            }
+        if not matching_code:
+            opts = ", ".join(f"{c['n']} ({c['c']})" for c in candidates[:5])
+            return {
+                "ok": False,
+                "error": (
+                    f"Client ambigu o no coincident per '{clean_name}'. Opcions trobades: {opts}. "
+                    "No escric res fins que el client sigui inequívoc."
+                ),
+            }
+
+        resolved = matching_code[0]
+        return {"ok": True, "client": int(resolved["c"]), "client_name": resolved["n"] or clean_name}
+
     async def _search_articles_batch(self, texts: list):
         """Busca múltiples articles en paral·lel i retorna {query: resultats}."""
         results = await asyncio.gather(*[self._find_article_matches(t) for t in texts], return_exceptions=True)
@@ -870,15 +944,28 @@ class GeminiHitAssistant:
         client_name: str = "?",
         article_name: str = "?",
     ):
+        validated = await self._validate_order_client(client, client_name)
+        if not validated.get("ok"):
+            logger.warning(
+                "add_order bloquejat per validacio client: client=%s client_name=%r article=%s error=%s",
+                client,
+                client_name,
+                article_code,
+                validated.get("error"),
+            )
+            return validated
+
+        client = validated["client"]
+        client_name = validated["client_name"]
         self.last_context["date"] = date
         self.last_context["client"] = client
-        if client_name and client_name != "?":
-            self.last_context["client_name"] = client_name
+        self.last_context["client_name"] = client_name
         return {
             NEEDS_CONFIRMATION: True,
             "date": date,
             "client": client,
             "client_name": client_name,
+            "client_validated": True,
             "article_code": article_code,
             "article_name": article_name,
             "quantity": quantity,
