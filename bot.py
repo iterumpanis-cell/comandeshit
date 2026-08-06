@@ -34,6 +34,10 @@ from gemini_hit import GeminiHitAssistant, NEEDS_SELECTION, NEEDS_CONFIRMATION
 import mcp_vendes as mcp_module
 from mcp_vendes import MCPVendes
 from printer import _format_totals_escpos, imprimir_text_directe
+from services.client_resolver import ClientResolver
+from services.order_service import OrderService
+from services.html_order_delete import delete_order_line_html
+from services.html_order_update import update_order_line_html
 
 # ------------------------------------------------------------------ #
 #  Logging                                                             #
@@ -124,11 +128,13 @@ def _get_copies(client_code: int) -> int:
     EB_CLIENT, EB_CLIENT_OPCIO, EB_DATA, EB_PRODUCTE, EB_PRODUCTE_OPCIO, EB_CONFIRMAR,
     VD_SHOP, VD_DATE, VD_REPORT,
     IM_DATA, IM_CLIENT, IM_CLIENT_OPCIO, IM_COPIES, IM_SEGUENT,
-    IM_TIPUS, IM_TEXT,
-) = range(26)
+    IM_TIPUS, IM_TEXT, EB_QUANTITAT,
+) = range(27)
 
 # Instàncies globals
 mcp = MCPVendes()
+client_resolver = ClientResolver(mcp, logger)
+order_service = OrderService(mcp, logger)
 
 ai = GeminiHitAssistant(
     config.GEMINI_API_KEY,
@@ -273,6 +279,18 @@ def _order_field_buttons(selected, prefix: str) -> list[list[InlineKeyboardButto
 
 
 def _manual_order_text(pending: dict) -> str:
+    if pending.get("mode") == "delete":
+        return (
+            "⚠️ *Confirma l'esborrament de la línia*\n\n"
+            f"👤 Client: *{pending.get('client_name')}*\n"
+            f"📅 Data: *{pending.get('date_display')}*\n"
+            f"🥖 Producte: *{pending.get('article_name')}*\n"
+            f"📌 Demanat: *{pending.get('requested', 0)}*  "
+            f"Servit: *{pending.get('served', 0)}*  "
+            f"Tornat: *{pending.get('returned', 0)}*\n"
+            f"🔖 Tipus: *{pending.get('order_type', 1)}*\n\n"
+            "S'obrirà la web HTML i es clicarà la paperera d'aquesta línia."
+        )
     action = "posar a 0" if pending.get("quantity") == 0 else f"posar a {pending.get('quantity')}"
     return (
         f"*Quins camps vols canviar?*\n\n"
@@ -287,7 +305,7 @@ def _manual_order_text(pending: dict) -> str:
 def _manual_order_keyboard(pending: dict) -> InlineKeyboardMarkup:
     rows = _order_field_buttons(pending.get("fields", set()), "order")
     if pending.get("mode") == "delete":
-        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:auto")])
+        rows.append([InlineKeyboardButton("⚠️ Confirmar esborrament", callback_data="order_apply:auto")])
     else:
         rows.append([
             InlineKeyboardButton("✅ Afegir", callback_data="order_apply:1"),
@@ -445,7 +463,33 @@ def _parse_all_orders_date(text: str) -> str | None:
 def _normalize_search_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    return re.sub(r"\s+", " ", without_accents.lower()).strip()
+    normalized_text = re.sub(r"\s*/\s*", "/", without_accents.lower())
+    return re.sub(r"\s+", " ", normalized_text).strip()
+
+
+ARTICLE_STRUCTURAL_KEYWORDS = ("1/2", "1/4", "kg", "rodo", "xusco")
+
+
+def _article_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+(?:/[a-z0-9]+)?", _normalize_search_text(text)))
+
+
+def _rank_article_options(text: str, options: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    query_tokens = _article_tokens(text)
+    structural = query_tokens.intersection(ARTICLE_STRUCTURAL_KEYWORDS)
+    descriptive = query_tokens.difference(ARTICLE_STRUCTURAL_KEYWORDS)
+
+    def sort_key(option: tuple[str, int]) -> tuple[float, int, int, str]:
+        name, _ = option
+        name_tokens = _article_tokens(name)
+        structural_hits = len(structural.intersection(name_tokens))
+        descriptive_hits = len(descriptive.intersection(name_tokens))
+        structural_score = structural_hits / len(structural) if structural else 1.0
+        descriptive_score = descriptive_hits / len(descriptive) if descriptive else 1.0
+        score = structural_score * 0.65 + descriptive_score * 0.3 + _article_match_score(text, name) * 0.05
+        return (-score, -structural_hits, -descriptive_hits, name.lower())
+
+    return sorted(options, key=sort_key)
 
 
 def _article_match_score(query: str, article_name: str) -> float:
@@ -465,7 +509,7 @@ def _article_match_score(query: str, article_name: str) -> float:
     return max(ratio, token_score)
 
 
-async def _fallback_article_options(text: str, limit: int = 8) -> list[tuple[str, int]]:
+async def _fallback_article_options(text: str, limit: int = 20) -> list[tuple[str, int]]:
     articles = await mcp.llistar_tots_articles()
     ranked = []
     for item in articles:
@@ -478,7 +522,7 @@ async def _fallback_article_options(text: str, limit: int = 8) -> list[tuple[str
             ranked.append((score, str(name), int(code)))
 
     ranked.sort(key=lambda item: (-item[0], item[1].lower()))
-    return [(name, code) for _, name, code in ranked[:limit]]
+    return _rank_article_options(text, [(name, code) for _, name, code in ranked[:limit]])
 
 
 def _is_print_request(text: str) -> bool:
@@ -1459,7 +1503,17 @@ def _looks_operational_ai_request(text: str) -> bool:
     t = _normalize_plain_text(text)
     problem_words = ("problema", "falla", "fallat", "error", "arregla", "arreglal", "mcp", "automatic", "automatica")
     action_words = ("envia", "enviar", "imprimeix", "imprimir", "comandes", "albarans")
-    return any(w in t for w in problem_words) and any(w in t for w in action_words)
+    if any(w in t for w in problem_words) and any(w in t for w in action_words):
+        return True
+
+    # Una ordre global d'enviament no ha de passar pel flux de comanda individual.
+    has_global_target = any(w in t for w in ("totes", "tots", "clients", "albarans", "comandes"))
+    has_order = any(w in t for w in ("comand", "albar"))
+    has_send_action = any(w in t for w in ("envia", "enviar", "imprimeix", "imprimir"))
+    has_date = bool(re.search(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", t)) or any(
+        w in t for w in ("avui", "demà", "dema", "hoy", "mañana", "manana")
+    )
+    return has_global_target and has_order and has_send_action and has_date
 
 
 def _operational_request_date(text: str) -> tuple[str, str]:
@@ -1927,6 +1981,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data["pending_order_edit"] = pending
             await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
             return
+        if pending.get("mode") == "delete":
+            await query.edit_message_text("🧠💭 Obrint la comanda HTML i validant la línia...")
+            result = await delete_order_line_html(pending)
+            if result.get("ok"):
+                await query.message.reply_text(
+                    f"🗑️ Esborrat correctament amb la paperera HTML.\n\n"
+                    f"👤 {pending['client_name']}\n"
+                    f"📅 {pending['date_display']}\n"
+                    f"🥖 {pending['article_name']}\n"
+                    f"📌 D{pending['requested']}/S{pending['served']}/T{pending['returned']} "
+                    f"· tipus {pending['order_type']}"
+                )
+            else:
+                await query.message.reply_text(
+                    f"❌ No s'ha esborrat la línia: {result.get('error', 'Error desconegut')}"
+                )
+            return
         order_type_raw = data.split(":", 1)[1]
         quantity = int(pending.get("quantity", 0))
         kwargs = {ORDER_FIELD_KWARGS[f]: quantity for f in fields}
@@ -1965,7 +2036,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             {k: pending.get(k) for k in ("mode", "client_code", "date_mcp", "article_code", "quantity")},
         )
         await query.edit_message_text("⏳ Aplicant canvi...")
-        result = await mcp.canviar_linia_mcp(
+        result = await order_service.update_line(
             pending["date_mcp"],
             pending["client_code"],
             pending["article_code"],
@@ -1979,7 +2050,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"👤 {pending['client_name']}\n"
                 f"📅 {pending['date_display']}\n"
                 f"🥖 {pending['article_name']}\n"
-                f"📌 {_format_order_fields(fields)}: {action}"
+                f"📌 {_format_order_fields(fields)}: {action}\n\n"
+                "Vols afegir algun producte més al mateix client i data?",
+                reply_markup=ReplyKeyboardMarkup(
+                    [["✅ Sí, un altre", "🏁 Acabar"]],
+                    one_time_keyboard=True,
+                    resize_keyboard=True,
+                ),
             )
         else:
             await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
@@ -2267,11 +2344,7 @@ async def af_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)  # [{"c": codi, "n": nom}]
-    except Exception as e:
-        logger.warning(f"af_client: cercar_client excepció: {e}")
-        resultats = []
+    resultats = [{"n": name, "c": code} for name, code in await client_resolver.resolve(text)]
     try:
         await cerca_msg.delete()
     except Exception:
@@ -2287,31 +2360,18 @@ async def af_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AF_CLIENT
 
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
+    text_norm = _normalize_search_text(text)
+    exactes = [(n, c) for n, c in opcions if _normalize_search_text(n) == text_norm]
+    coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
 
-    if len(coincidencies) == 1:
-        name, code = coincidencies[0]
+    if len(exactes) == 1:
+        name, code = exactes[0]
         context.user_data["client"] = name
         context.user_data["client_code"] = code
         await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
         return await _demanar_data(update)
 
-    if len(opcions) == 1:
-        name, code = opcions[0]
-        context.user_data["client"] = name
-        context.user_data["client_code"] = code
-        await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-        return await _demanar_data(update)
-
-    llista = coincidencies if len(coincidencies) > 1 else opcions
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-            parse_mode="Markdown",
-        )
-        return AF_CLIENT
+    llista = (coincidencies if coincidencies else opcions)[:8]
 
     context.user_data["client_opcions"] = {n: c for n, c in llista}
     keyboard = [[n] for n, _ in llista]
@@ -2390,12 +2450,18 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"af_producte: cercar_article excepció: {e}")
         resultats = []
     fallback_used = False
-    if not resultats:
+    query_tokens = _article_tokens(text)
+    structural_query = query_tokens.intersection(ARTICLE_STRUCTURAL_KEYWORDS)
+    if not resultats or structural_query:
         try:
             fallback_options = await _fallback_article_options(text)
             if fallback_options:
-                fallback_used = True
-                resultats = [{"n": name, "c": code} for name, code in fallback_options]
+                fallback_used = not resultats
+                resultats = resultats + [
+                    {"n": name, "c": code}
+                    for name, code in fallback_options
+                    if not any(existing.get("c") == code for existing in resultats)
+                ]
                 logger.info("af_producte: fallback cataleg per %r -> %s", text, fallback_options)
         except Exception as e:
             logger.warning("af_producte: fallback cataleg excepcio per %r: %s", text, e)
@@ -2417,8 +2483,9 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_norm = _normalize_search_text(text)
     coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
 
-    if len(coincidencies) == 1:
-        name, code = coincidencies[0]
+    exactes = [(n, c) for n, c in opcions if _normalize_search_text(n) == text_norm]
+    if len(exactes) == 1:
+        name, code = exactes[0]
         context.user_data["producte"] = name
         context.user_data["article_code"] = code
         await update.message.reply_text(
@@ -2427,24 +2494,9 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AF_QUANTITAT
 
-    if len(opcions) == 1:
-        name, code = opcions[0]
-        context.user_data["producte"] = name
-        context.user_data["article_code"] = code
-        await update.message.reply_text(
-            f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?",
-            parse_mode="Markdown",
-        )
-        return AF_QUANTITAT
-
-    llista = coincidencies if len(coincidencies) > 1 else opcions
-
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del producte:",
-            parse_mode="Markdown",
-        )
-        return AF_PRODUCTE
+    # Amb mides/tipus, el rànquing per paraules clau és més fiable que exigir
+    # que tota la frase aparegui seguida al nom de l'article.
+    llista = (opcions if structural_query else (coincidencies if coincidencies else opcions))[:8]
 
     context.user_data["article_opcions"] = {n: c for n, c in llista}
     keyboard = [[n] for n, _ in llista]
@@ -2515,12 +2567,28 @@ async def af_quantitat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=_manual_order_keyboard(pending),
     )
-    return ConversationHandler.END
+    return AF_CONFIRMAR
 
 
 async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     reply_markup = ReplyKeyboardRemove()
+    text_lower = text.lower()
+
+    if "altre" in text_lower and ("sí" in text_lower or "si" in text_lower):
+        for key in ("producte", "article_code", "quantitat", "pending_order_edit"):
+            context.user_data.pop(key, None)
+        await update.message.reply_text(
+            "🥖 Quin *producte*?",
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        return AF_PRODUCTE
+
+    if "acabar" in text_lower:
+        context.user_data.clear()
+        await update.message.reply_text("🏁 Procés acabat.", reply_markup=reply_markup)
+        return ConversationHandler.END
 
     if "❌" in text or "cancel" in text.lower():
         await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
@@ -2546,18 +2614,47 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     data_mcp = _to_mcp_date(d["data"])
-    result = await mcp.afegir_linia_mcp(data_mcp, client_code, article_code, d["quantitat"], order_type)
+    result = await order_service.add_line(
+        data_mcp, client_code, article_code, d["quantitat"], order_type
+    )
     ok = result.get("ok", False)
     error = result.get("error", "Error desconegut")
 
     if ok:
         etiqueta = "Encarreg" if encarreg else "Afegit"
+        try:
+            print_result = await mcp.imprimir_albarans(data_mcp, client_code, copies=1)
+        except Exception as exc:
+            print_result = {"error": str(exc)}
+            logger.exception("Error reimprimint la comanda modificada client=%s", client_code)
+        print_ok = not print_result.get("error")
+        print_status = (
+            "albarà enviat a la impressora"
+            if print_ok
+            else f"error enviant l'albarà a la impressora: {print_result.get('error')}"
+        )
+        notification = (
+            f"<b>Comanda modificada</b>\n"
+            f"Client: {d['client']}\n"
+            f"Data: {d['data']}\n"
+            f"Producte: {d['producte']} x{d['quantitat']}\n"
+            f"Modificació: {etiqueta.lower()} correctament\n"
+            f"Impressió: {print_status}"
+        )
+        await _notify_auto_all_users(context.bot, notification)
         await update.message.reply_text(
             f"✅ *{etiqueta} correctament!*\n\n"
             f"👤 {d['client']}\n"
             f"📅 {d['data']}\n"
-            f"🥖 {d['producte']} × {d['quantitat']}",
+            f"🥖 {d['producte']} × {d['quantitat']}\n\n"
+            f"🖨️ {print_status}\n\n"
+            "Vols afegir algun producte més al mateix client i data?",
             parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(
+                [["✅ Sí, un altre", "🏁 Acabar"]],
+                one_time_keyboard=True,
+                resize_keyboard=True,
+            ),
         )
     else:
         await update.message.reply_text(f"❌ Error MCP: {error}")
@@ -2597,17 +2694,14 @@ async def vr_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)
-    except Exception as e:
-        logger.warning(f"vr_client: cercar_client excepció: {e}")
-        resultats = []
+    resultats = [{"n": name, "c": code} for name, code in await client_resolver.resolve(text)]
     try:
         await cerca_msg.delete()
     except Exception:
         pass
 
     opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
+    opcions = _rank_article_options(text, opcions)
     logger.info(f"vr_client: {len(opcions)} opcions per '{text}': {opcions}")
 
     if len(opcions) == 0:
@@ -2636,12 +2730,7 @@ async def vr_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     llista = coincidencies if len(coincidencies) > 1 else opcions
 
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-            parse_mode="Markdown",
-        )
-        return VR_CLIENT
+    llista = llista[:8]
 
     context.user_data["client_opcions"] = {n: c for n, c in llista}
     keyboard = [[n] for n, _ in llista]
@@ -2771,11 +2860,7 @@ async def eb_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-    try:
-        resultats = await mcp.cercar_client(text)
-    except Exception as e:
-        logger.warning(f"eb_client: cercar_client excepció: {e}")
-        resultats = []
+    resultats = [{"n": name, "c": code} for name, code in await client_resolver.resolve(text)]
     try:
         await cerca_msg.delete()
     except Exception:
@@ -2787,22 +2872,17 @@ async def eb_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Client no trobat. Prova amb un nom diferent:")
         return EB_CLIENT
 
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-    llista = coincidencies if len(coincidencies) >= 1 else opcions
-
-    if len(llista) == 1:
-        name, code = llista[0]
+    text_norm = _normalize_search_text(text)
+    exactes = [(n, c) for n, c in opcions if _normalize_search_text(n) == text_norm]
+    coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
+    if len(exactes) == 1:
+        name, code = exactes[0]
         context.user_data["client"] = name
         context.user_data["client_code"] = code
         await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
         return await _demanar_data_eb(update)
 
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:"
-        )
-        return EB_CLIENT
+    llista = (coincidencies if coincidencies else opcions)[:8]
 
     context.user_data["client_opcions"] = {n: c for n, c in llista}
     keyboard = [[n] for n, _ in llista]
@@ -2867,9 +2947,36 @@ async def eb_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cerca_msg = await update.message.reply_text("🔍 Cercant producte...")
     try:
-        resultats = await mcp.cercar_article(text)
+        data_mcp = _to_mcp_date(context.user_data["data"])
+        order_result = await mcp.veure_comanda(data_mcp, int(context.user_data["client_code"]))
+        resultats = []
+        active_lines = [
+            line for line in order_result.get("order", [])
+            if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0)
+        ]
+        counts = {}
+        for line in active_lines:
+            key = (line.get("art") or line.get("article_code"), line.get("nm") or line.get("name"))
+            counts[key] = counts.get(key, 0) + 1
+        for line in active_lines:
+            name = line.get("nm") or line.get("name")
+            code = line.get("art") or line.get("article_code")
+            if not name or code is None:
+                continue
+            order_type = int(line.get("order_type", 1) or 1)
+            label = str(name)
+            if counts.get((code, name), 0) > 1:
+                label = f"{name} [tipus {order_type}, D{line.get('requested', 0)}/S{line.get('served', 0)}/T{line.get('returned', 0)}]"
+            resultats.append({
+                "n": label,
+                "c": code,
+                "order_type": order_type,
+                "requested": int(line.get("requested", 0) or 0),
+                "served": int(line.get("served", 0) or 0),
+                "returned": int(line.get("returned", 0) or 0),
+            })
     except Exception as e:
-        logger.warning(f"eb_producte: cercar_article excepció: {e}")
+        logger.warning(f"eb_producte: veure_comanda excepció: {e}")
         resultats = []
     try:
         await cerca_msg.delete()
@@ -2877,26 +2984,25 @@ async def eb_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
+    context.user_data["article_lines"] = {
+        str(r["n"]): r for r in resultats if r.get("n") is not None
+    }
 
     if len(opcions) == 0:
         await update.message.reply_text("❌ Producte no trobat. Prova amb un nom diferent:")
         return EB_PRODUCTE
 
-    text_lower = text.lower()
-    coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-    llista = coincidencies if len(coincidencies) >= 1 else opcions
-
-    if len(llista) == 1:
-        name, code = llista[0]
+    text_norm = _normalize_search_text(text)
+    exactes = [(n, c) for n, c in opcions if _normalize_search_text(n) == text_norm]
+    coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
+    if len(exactes) == 1:
+        name, code = exactes[0]
         context.user_data["producte"] = name
         context.user_data["article_code"] = code
-        return await _confirmar_esborrar(update, context)
+        context.user_data["article_line"] = context.user_data.get("article_lines", {}).get(name, {})
+        return await _demanar_quantitat_esborrar(update, context)
 
-    if len(llista) > 8:
-        await update.message.reply_text(
-            f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del producte:"
-        )
-        return EB_PRODUCTE
+    llista = (coincidencies if coincidencies else opcions)[:8]
 
     context.user_data["article_opcions"] = {n: c for n, c in llista}
     keyboard = [[n] for n, _ in llista]
@@ -2923,8 +3029,74 @@ async def eb_producte_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     opcions = context.user_data.get("article_opcions", {})
     context.user_data["producte"] = text
     context.user_data["article_code"] = opcions.get(text)
+    context.user_data["article_line"] = context.user_data.get("article_lines", {}).get(text, {})
     await update.message.reply_text(f"✅ Producte: *{text}*", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    return await _confirmar_esborrar(update, context)
+    return await _demanar_quantitat_esborrar(update, context)
+
+
+async def _demanar_quantitat_esborrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    line = context.user_data.get("article_line", {})
+    await update.message.reply_text(
+        f"📋 *Línia seleccionada*\n\n"
+        f"👤 {context.user_data['client']}\n"
+        f"📅 {context.user_data['data']}\n"
+        f"🥖 {context.user_data['producte']}\n"
+        f"📌 Demanat: *{line.get('requested', 0)}*  "
+        f"Servit: *{line.get('served', 0)}*  "
+        f"Tornat: *{line.get('returned', 0)}*\n"
+        f"🔖 Tipus: *{line.get('order_type', 1)}*\n\n"
+        "Quina quantitat final vols que quedi?\n"
+        "Escriu *0* per esborrar completament la línia.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return EB_QUANTITAT
+
+
+async def eb_quantitat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        quantity = int(update.message.text.strip())
+        if quantity < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Escriu un número enter igual o superior a 0.")
+        return EB_QUANTITAT
+
+    if quantity == 0:
+        return await _confirmar_esborrar(update, context)
+
+    d = context.user_data
+    line = d.get("article_line", {})
+    pending = {
+        "client_name": d["client"],
+        "date_display": d["data"],
+        "article_name": d["producte"],
+        "article_code": d["article_code"],
+        "requested": int(line.get("requested", 0) or 0),
+        "served": int(line.get("served", 0) or 0),
+        "returned": int(line.get("returned", 0) or 0),
+        "order_type": int(line.get("order_type", 1) or 1),
+    }
+    estat_msg = await update.message.reply_text(
+        f"🧠💭 Actualitzant *{d['producte']}* a Demanat {quantity} i Servit {quantity}...",
+        parse_mode="Markdown",
+    )
+    result = await update_order_line_html(pending, quantity)
+    try:
+        await estat_msg.delete()
+    except Exception:
+        pass
+    if result.get("ok"):
+        await update.message.reply_text(
+            f"✅ Línia actualitzada.\n\n👤 {d['client']}\n📅 {d['data']}\n"
+            f"🥖 {d['producte']}\n📌 Demanat: {quantity} · Servit: {quantity}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ No s'ha pogut actualitzar la línia: {result.get('error', 'Error desconegut')}"
+        )
+    return ConversationHandler.END
 
 
 async def _confirmar_esborrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2939,6 +3111,10 @@ async def _confirmar_esborrar(update: Update, context: ContextTypes.DEFAULT_TYPE
         "article_code": d["article_code"],
         "quantity": 0,
         "fields": {"requested", "served", "returned"},
+        "requested": int(d.get("article_line", {}).get("requested", 0) or 0),
+        "served": int(d.get("article_line", {}).get("served", 0) or 0),
+        "returned": int(d.get("article_line", {}).get("returned", 0) or 0),
+        "order_type": int(d.get("article_line", {}).get("order_type", 1) or 1),
     }
     context.user_data["pending_order_edit"] = pending
     logger.info(
@@ -2984,16 +3160,8 @@ async def eb_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0)
     ]
     candidates = linies_actives or linies
-    order_type = int(candidates[0].get("order_type", 1) or 1) if len(candidates) == 1 else 1
-    result = await mcp.canviar_linia_mcp(
-        data_mcp,
-        client_code,
-        article_code,
-        order_type,
-        requested_quantity=0,
-        served_quantity=0,
-        returned_quantity=0,
-    )
+    order_type = int(d.get("order_type") or (candidates[0].get("order_type", 1) if len(candidates) == 1 else 1))
+    result = await order_service.cancel_line(data_mcp, client_code, article_code, order_type)
     ok = result.get("ok", False)
 
     await _tancar_estat(estat_msg)
@@ -3491,7 +3659,9 @@ def _write_auto_envia_state(data_mcp: str, state: dict) -> None:
     AUTO_ENVIA_STATE_DIR.mkdir(exist_ok=True)
     path = _auto_envia_state_path(data_mcp)
     payload = {**state, "date": data_mcp, "updated_at": datetime.now().isoformat(timespec="seconds")}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _claim_auto_envia_run(data_mcp: str) -> bool:
@@ -3526,6 +3696,8 @@ def _claim_auto_envia_run(data_mcp: str) -> bool:
             logger.warning("Auto enviament: estat running antic per %s, reintentant", data_mcp)
         else:
             logger.info("Auto enviament: estat anterior %s per %s, reintentant", status, data_mcp)
+        payload["clients"] = state.get("clients", {})
+        payload["run_count"] = int(state.get("run_count", 0) or 0) + 1
         _write_auto_envia_state(data_mcp, payload)
         return True
 
@@ -3551,6 +3723,45 @@ def _auto_envia_dins_finestra_cron(now: datetime | None = None) -> bool:
     """Evita que PM2 executi l'enviament nomes per arrencar o resurrectar l'app."""
     now = now or datetime.now()
     return now.hour == 13 and now.minute <= 10
+
+
+async def _auto_send_client(data_mcp: str, client: dict, state: dict) -> tuple[bool, str | None]:
+    codi = client.get("codi")
+    nom = client.get("nom", str(codi))
+    copies = _get_copies(int(codi))
+    key = str(codi)
+    clients_state = state.setdefault("clients", {})
+    previous = clients_state.get(key, {})
+    if previous.get("status") == "success":
+        logger.info("Auto enviament: client %s ja enviat, saltant duplicat", codi)
+        return True, None
+
+    last_error = "error desconegut"
+    for attempt in range(1, 4):
+        clients_state[key] = {"name": nom, "copies": copies, "status": "sending", "attempts": attempt}
+        _write_auto_envia_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+        try:
+            result = await mcp.imprimir_albarans(data_mcp, int(codi), copies)
+            if isinstance(result, dict) and "error" not in result:
+                clients_state[key] = {
+                    "name": nom, "copies": copies, "status": "success",
+                    "attempts": attempt, "sent_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                _write_auto_envia_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+                return True, None
+            last_error = str((result or {}).get("error", "error MCP"))
+        except Exception as exc:
+            last_error = str(exc)
+            logger.exception("Auto enviament excepcio: client=%s intent=%s", codi, attempt)
+        if attempt < 3:
+            await asyncio.sleep(2 ** (attempt - 1))
+
+    clients_state[key] = {
+        "name": nom, "copies": copies, "status": "failed",
+        "attempts": 3, "error": last_error,
+    }
+    _write_auto_envia_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+    return False, f"{nom}: {last_error}"
 
 
 async def _run_auto_envia_comandes(bot: Bot):
@@ -3579,6 +3790,7 @@ async def _run_auto_envia_comandes(bot: Bot):
         await _notify_auto_all_users(bot, msg)
         return
 
+    state = _read_auto_envia_state(data_mcp) or {"status": "running", "clients": {}}
     impresos: list[str] = []
     errors: list[str] = []
     total_copies = 0
@@ -3591,23 +3803,17 @@ async def _run_auto_envia_comandes(bot: Bot):
             continue
 
         copies = _get_copies(int(codi))
-        logger.info("Auto enviament: imprimint date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
-        try:
-            result = await mcp.imprimir_albarans(data_mcp, int(codi), copies)
-            if "error" in result:
-                logger.warning("Auto enviament error: date=%s client=%s: %s", data_mcp, codi, result)
-                errors.append(f"{nom}: error")
-            else:
-                impresos.append(f"{nom} x{copies}")
-                total_copies += copies
-                for linia in client.get("linies", []):
-                    nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
-                    qty = linia.get("requested", 0)
-                    if qty > 0:
-                        totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
-        except Exception as e:
-            logger.exception("Auto enviament excepcio: client=%s", codi)
-            errors.append(f"{nom}: {e}")
+        sent, error = await _auto_send_client(data_mcp, client, state)
+        if error:
+            errors.append(error)
+            continue
+        impresos.append(f"{nom} x{copies}")
+        total_copies += copies
+        for linia in client.get("linies", []):
+            nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
+            qty = linia.get("requested", 0)
+            if qty > 0:
+                totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
 
     totals_lines = sorted(totals_articles.items(), key=lambda x: x[0].lower())
     totals_txt = ""
@@ -3641,9 +3847,16 @@ async def _run_auto_envia_comandes(bot: Bot):
 
     logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
     if errors:
-        _mark_auto_envia_failed(data_mcp, "; ".join(errors[:10]))
+        _write_auto_envia_state(data_mcp, {
+            "status": "partial", "clients": state.get("clients", {}),
+            "error": "; ".join(errors[:10]), "sent_clients": len(impresos),
+            "copies": total_copies,
+        })
     else:
-        _mark_auto_envia_success(data_mcp, clients=len(impresos), copies=total_copies)
+        _write_auto_envia_state(data_mcp, {
+            "status": "success", "clients": state.get("clients", {}),
+            "sent_clients": len(impresos), "copies": total_copies,
+        })
     await _notify_auto_all_users(bot, summary)
 
     if totals_lines:
@@ -3708,6 +3921,7 @@ def run_bot():
             EB_DATA:          [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_data)],
             EB_PRODUCTE:      [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte)],
             EB_PRODUCTE_OPCIO:[stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_producte_opcio)],
+            EB_QUANTITAT:     [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_quantitat)],
             EB_CONFIRMAR:     [stop_handler_msg, MessageHandler(filters.TEXT & ~filters.COMMAND, eb_confirmar)],
         },
         fallbacks=[stop_handler_msg, CommandHandler("cancel", cmd_cancel)],

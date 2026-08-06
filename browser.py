@@ -289,6 +289,164 @@ class HitSystemsBrowser:
         except Exception:
             return ""
 
+    async def esborrar_linia(self, client: str, data: str, article_code: int,
+                             requested: int, served: int, returned: int,
+                             order_type: int) -> dict:
+        """Elimina una fila clicant la paperera HTML després de validar-la."""
+        async with self._lock:
+            try:
+                await self._go_graella()
+
+                async def load_rows():
+                    head, _, main = await self._get_frames()
+                    await head.locator("#fecha").fill(data)
+                    if not await self._autocomplete(head, "Suggest_Cliente", "Cliente", client):
+                        return [], main
+                    await asyncio.sleep(1)
+                    _, _, main = await self._get_frames()
+                    rows = await main.evaluate(
+                        """() => Array.from(document.querySelectorAll('input[name^="articulo"]')).map(input => {
+                            const suffix = input.name.substring("articulo".length);
+                            const row = input.closest('tr');
+                            const value = name => document.querySelector(`input[name="${name}${suffix}"]`)?.value ?? "";
+                            const paper = Array.from(row?.querySelectorAll('a') || [])
+                                .find(a => (a.getAttribute('href') || '').includes('borraComanda'));
+                            return {suffix, article_code: value('articulo'), requested: value('qd'),
+                                served: value('qs'), returned: value('qt'), order_type: value('tipuscomanda'),
+                                id: value('idServit'), paper_href: paper?.getAttribute('href') || ''};
+                        })"""
+                    )
+                    return rows, main
+
+                rows, main = await load_rows()
+
+                def same_quantity(value, expected):
+                    try:
+                        return float(value or 0) == float(expected or 0)
+                    except (TypeError, ValueError):
+                        return str(value) == str(expected)
+
+                target = [
+                    row for row in rows
+                    if row["article_code"] == str(article_code)
+                    and same_quantity(row["requested"], requested)
+                    and same_quantity(row["served"], served)
+                    and same_quantity(row["returned"], returned)
+                    and row["order_type"] == str(order_type)
+                ]
+                if len(target) != 1:
+                    return {"ok": False, "error": f"No s'ha identificat una única línia ({len(target)} coincidències)."}
+                row = target[0]
+                if not row["id"] or not row["paper_href"]:
+                    return {"ok": False, "error": "La línia no té paperera o idServit."}
+
+                async def accept_dialog(dialog):
+                    await dialog.accept()
+
+                self._page.once("dialog", accept_dialog)
+                await main.evaluate(
+                    """(href) => {
+                        const link = Array.from(document.querySelectorAll('a'))
+                            .find(a => a.getAttribute('href') === href);
+                        if (!link) throw new Error('Paperera no trobada');
+                        link.click();
+                    }""",
+                    row["paper_href"],
+                )
+                await asyncio.sleep(1.5)
+                rows_after, _ = await load_rows()
+                remaining = [
+                    item for item in rows_after
+                    if item["article_code"] == str(article_code)
+                    and same_quantity(item["requested"], requested)
+                    and same_quantity(item["served"], served)
+                    and same_quantity(item["returned"], returned)
+                    and item["order_type"] == str(order_type)
+                ]
+                if remaining:
+                    return {"ok": False, "error": "La línia encara apareix després d'esborrar-la."}
+                return {"ok": True, "deleted_id": row["id"]}
+            except Exception as exc:
+                logger.exception("Error esborrant línia via HTML")
+                return {"ok": False, "error": str(exc)}
+
+    async def actualitzar_linia(self, client: str, data: str, article_code: int,
+                                requested: int, served: int, returned: int,
+                                order_type: int, new_quantity: int) -> dict:
+        """Actualitza demanat i servit de la fila HTML identificada."""
+        async with self._lock:
+            try:
+                await self._go_graella()
+                head, _, _ = await self._get_frames()
+                await head.locator("#fecha").fill(data)
+                if not await self._autocomplete(head, "Suggest_Cliente", "Cliente", client):
+                    return {"ok": False, "error": f"Client '{client}' no trobat."}
+                await asyncio.sleep(1)
+                _, _, main = await self._get_frames()
+                rows = await main.evaluate(
+                    """() => Array.from(document.querySelectorAll('input[name^="articulo"]')).map(input => {
+                        const suffix = input.name.substring("articulo".length);
+                        const value = name => document.querySelector(`input[name="${name}${suffix}"]`)?.value ?? "";
+                        return {suffix, article_code: value('articulo'), requested: value('qd'), served: value('qs'),
+                            returned: value('qt'), order_type: value('tipuscomanda')};
+                    })"""
+                )
+
+                def same_quantity(value, expected):
+                    try:
+                        return float(value or 0) == float(expected or 0)
+                    except (TypeError, ValueError):
+                        return str(value) == str(expected)
+
+                target = [
+                    row for row in rows
+                    if row["article_code"] == str(article_code)
+                    and same_quantity(row["requested"], requested)
+                    and same_quantity(row["served"], served)
+                    and same_quantity(row["returned"], returned)
+                    and row["order_type"] == str(order_type)
+                ]
+                if len(target) != 1:
+                    return {"ok": False, "error": f"No s'ha identificat una única línia ({len(target)} coincidències)."}
+
+                suffix = target[0]["suffix"]
+                await main.evaluate(
+                    """({suffix, quantity}) => {
+                        const qd = document.querySelector(`input[name="qd${suffix}"]`);
+                        const qs = document.querySelector(`input[name="qs${suffix}"]`);
+                        if (!qd || !qs) throw new Error('Camps qd/qs no trobats');
+                        qd.value = String(quantity);
+                        qs.value = String(quantity);
+                        if (typeof goNext !== 'function') throw new Error('Funció goNext no disponible');
+                        goNext(qd);
+                    }""",
+                    {"suffix": suffix, "quantity": new_quantity},
+                )
+                await asyncio.sleep(1.5)
+                _, _, main = await self._get_frames()
+                rows_after = await main.evaluate(
+                    """() => Array.from(document.querySelectorAll('input[name^="articulo"]')).map(input => {
+                        const suffix = input.name.substring("articulo".length);
+                        const value = name => document.querySelector(`input[name="${name}${suffix}"]`)?.value ?? "";
+                        return {article_code: value('articulo'), requested: value('qd'), served: value('qs'),
+                            returned: value('qt'), order_type: value('tipuscomanda')};
+                    })"""
+                )
+                verified = [
+                    row for row in rows_after
+                    if row["article_code"] == str(article_code)
+                    and same_quantity(row["requested"], new_quantity)
+                    and same_quantity(row["served"], new_quantity)
+                    and same_quantity(row["returned"], returned)
+                    and row["order_type"] == str(order_type)
+                ]
+                if not verified:
+                    return {"ok": False, "error": "La quantitat no s'ha pogut verificar després de guardar."}
+                return {"ok": True, "quantity": new_quantity}
+            except Exception as exc:
+                logger.exception("Error actualitzant línia via HTML")
+                return {"ok": False, "error": str(exc)}
+
     # ------------------------------------------------------------------ #
     #  Afegir línia de comanda                                            #
     # ------------------------------------------------------------------ #
@@ -433,4 +591,3 @@ class HitSystemsBrowser:
                 pass
 
             return options
-
