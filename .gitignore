@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 bot.log
 bot_log.txt
+*.html
+*.pdf
+exports/
 bot_state.pkl
 bot.lock
 authorized_users.json
