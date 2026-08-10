@@ -8,6 +8,7 @@ VR_CLIENT, VR_CLIENT_OPCIO, VR_DATA = range(3)
 def build_veure_handler(**deps) -> ConversationHandler:
     logger = deps["logger"]
     mcp = deps["mcp"]
+    client_resolver = deps["client_resolver"]
     autoritzat = deps["autoritzat"]
     rebuig = deps["rebuig"]
     is_admin = deps["is_admin"]
@@ -45,11 +46,7 @@ def build_veure_handler(**deps) -> ConversationHandler:
     async def vr_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-        try:
-            resultats = await mcp.cercar_client(text)
-        except Exception as e:
-            logger.warning("vr_client: cercar_client excepció: %s", e)
-            resultats = []
+        resultats = [{"n": name, "c": code} for name, code in await client_resolver.resolve(text)]
         try:
             await cerca_msg.delete()
         except Exception:
@@ -78,12 +75,7 @@ def build_veure_handler(**deps) -> ConversationHandler:
             return await demanar_data_veure(update)
 
         llista = coincidencies if len(coincidencies) > 1 else opcions
-        if len(llista) > 8:
-            await update.message.reply_text(
-                f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-                parse_mode="Markdown",
-            )
-            return VR_CLIENT
+        llista = llista[:8]
 
         context.user_data["client_opcions"] = {n: c for n, c in llista}
         keyboard = [[n] for n, _ in llista]

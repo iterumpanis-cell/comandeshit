@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from telegram import Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 from services.mcp_runtime import persist_mcp_url, set_runtime_mcp_url
@@ -21,9 +21,11 @@ def build_callback_handler(
     confirmation_text,
     confirmation_keyboard,
     format_order_ticket,
+    html_delete_line,
     load_auth_data,
     save_auth_data,
     get_admin_user_id,
+    get_copies,
     base_dir,
 ):
     async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -31,6 +33,22 @@ def build_callback_handler(
         query = update.callback_query
         await query.answer()
         data = query.data
+
+        if data.startswith("reprint_order:"):
+            try:
+                _, data_mcp, client_raw = data.split(":", 2)
+                client_code = int(client_raw)
+            except Exception:
+                await query.edit_message_text("❌ No puc identificar l'albarà a reimprimir.")
+                return
+            copies = get_copies(client_code)
+            await query.edit_message_text(f"⏳ Reimprimint albarà ({copies} còpia/es)...")
+            result = await mcp.imprimir_albarans(data_mcp, client_code, copies)
+            if isinstance(result, dict) and not result.get("error"):
+                await query.message.reply_text(f"✅ Albarà reimprès amb {copies} còpia/es.")
+            else:
+                await query.message.reply_text(f"❌ Error reimprimint: {(result or {}).get('error', 'Error desconegut')}")
+            return
 
         if data == "op_send_no":
             context.user_data.pop("pending_operational_send", None)
@@ -133,6 +151,23 @@ def build_callback_handler(
                 context.user_data["pending_order_edit"] = pending
                 await query.answer("Tria almenys un camp: Demanat, Servit o Tornat.", show_alert=True)
                 return
+            if pending.get("mode") == "delete":
+                await query.edit_message_text("🧠💭 Obrint la comanda HTML i validant la línia...")
+                result = await html_delete_line(pending)
+                if result.get("ok"):
+                    await query.message.reply_text(
+                        f"🗑️ Esborrat correctament amb la paperera HTML.\n\n"
+                        f"👤 {pending['client_name']}\n"
+                        f"📅 {pending['date_display']}\n"
+                        f"🥖 {pending['article_name']}\n"
+                        f"📌 D{pending['requested']}/S{pending['served']}/T{pending['returned']} "
+                        f"· tipus {pending['order_type']}"
+                    )
+                else:
+                    await query.message.reply_text(
+                        f"❌ No s'ha esborrat la línia: {result.get('error', 'Error desconegut')}"
+                    )
+                return
             order_type_raw = data.split(":", 1)[1]
             quantity = int(pending.get("quantity", 0))
             kwargs = {order_field_kwargs[f]: quantity for f in fields}
@@ -185,7 +220,13 @@ def build_callback_handler(
                     f"👤 {pending['client_name']}\n"
                     f"📅 {pending['date_display']}\n"
                     f"🥖 {pending['article_name']}\n"
-                    f"📌 {format_order_fields(fields)}: {action}"
+                    f"📌 {format_order_fields(fields)}: {action}\n\n"
+                    "Vols afegir algun producte més al mateix client i data?",
+                    reply_markup=ReplyKeyboardMarkup(
+                        [["✅ Sí, un altre", "🏁 Acabar"]],
+                        one_time_keyboard=True,
+                        resize_keyboard=True,
+                    ),
                 )
             else:
                 await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
@@ -327,6 +368,17 @@ def build_callback_handler(
 
             for line in lines:
                 try:
+                    if not line.get("client_validated"):
+                        errors.append(
+                            f"❌ {line.get('article_name', '?')}: client no validat per MCP. "
+                            "No escric res per evitar equivocar el client."
+                        )
+                        logger.warning(
+                            "confirm_apply bloquejat: client no validat user=%s line=%s",
+                            query.from_user.id,
+                            {k: line.get(k) for k in ("date", "client", "client_name", "article_code", "quantity", "order_type")},
+                        )
+                        continue
                     order_type = forced_order_type if forced_order_type in (1, 2) else line.get("order_type", 1)
                     logger.info(
                         "confirm_apply user=%s order_type=%s fields=%s line=%s",

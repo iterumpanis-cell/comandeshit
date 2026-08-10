@@ -47,7 +47,9 @@ class AutoSender:
         self.state_dir.mkdir(exist_ok=True)
         path = self.state_path(data_mcp)
         payload = {**state, "date": data_mcp, "updated_at": datetime.now().isoformat(timespec="seconds")}
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
 
     def claim_run(self, data_mcp: str) -> bool:
         self.state_dir.mkdir(exist_ok=True)
@@ -81,6 +83,8 @@ class AutoSender:
                 self.logger.warning("Auto enviament: estat running antic per %s, reintentant", data_mcp)
             else:
                 self.logger.info("Auto enviament: estat anterior %s per %s, reintentant", status, data_mcp)
+            payload["clients"] = state.get("clients", {})
+            payload["run_count"] = int(state.get("run_count", 0) or 0) + 1
             self.write_state(data_mcp, payload)
             return True
 
@@ -105,6 +109,44 @@ class AutoSender:
     async def run_with_new_bot(self):
         async with Bot(token=self.telegram_token) as bot:
             await self.run(bot)
+
+    async def _send_client(self, data_mcp: str, client: dict, state: dict) -> tuple[bool, str | None]:
+        codi = client.get("codi")
+        nom = client.get("nom", str(codi))
+        copies = self.get_copies(int(codi))
+        key = str(codi)
+        clients_state = state.setdefault("clients", {})
+        previous = clients_state.get(key, {})
+        if previous.get("status") == "success":
+            self.logger.info("Auto enviament: client %s ja enviat, saltant duplicat", codi)
+            return True, None
+
+        last_error = "error desconegut"
+        for attempt in range(1, 4):
+            clients_state[key] = {"name": nom, "copies": copies, "status": "sending", "attempts": attempt}
+            self.write_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+            try:
+                result = await self.mcp.imprimir_albarans(data_mcp, int(codi), copies)
+                if isinstance(result, dict) and "error" not in result:
+                    clients_state[key] = {
+                        "name": nom, "copies": copies, "status": "success",
+                        "attempts": attempt, "sent_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    self.write_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+                    return True, None
+                last_error = str((result or {}).get("error", "error MCP"))
+            except Exception as exc:
+                last_error = str(exc)
+                self.logger.exception("Auto enviament excepcio: client=%s intent=%s", codi, attempt)
+            if attempt < 3:
+                await asyncio.sleep(2 ** (attempt - 1))
+
+        clients_state[key] = {
+            "name": nom, "copies": copies, "status": "failed",
+            "attempts": 3, "error": last_error,
+        }
+        self.write_state(data_mcp, {**state, "status": "running", "clients": clients_state})
+        return False, f"{nom}: {last_error}"
 
     async def run(self, bot: Bot):
         dema = date.today() + timedelta(days=1)
@@ -131,6 +173,7 @@ class AutoSender:
             await self.notify_all_users(bot, msg)
             return
 
+        state = self.read_state(data_mcp) or {"status": "running", "clients": {}}
         impresos: list[str] = []
         errors: list[str] = []
         total_copies = 0
@@ -142,23 +185,17 @@ class AutoSender:
             if not codi:
                 continue
             copies = self.get_copies(int(codi))
-            self.logger.info("Auto enviament: imprimint date=%s client=%s (%s) copies=%s", data_mcp, codi, nom, copies)
-            try:
-                result = await self.mcp.imprimir_albarans(data_mcp, int(codi), copies)
-                if "error" in result:
-                    self.logger.warning("Auto enviament error: date=%s client=%s: %s", data_mcp, codi, result)
-                    errors.append(f"{nom}: error")
-                else:
-                    impresos.append(f"{nom} x{copies}")
-                    total_copies += copies
-                    for linia in client.get("linies", []):
-                        nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
-                        qty = linia.get("requested", 0)
-                        if qty > 0:
-                            totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
-            except Exception as e:
-                self.logger.exception("Auto enviament excepcio: client=%s", codi)
-                errors.append(f"{nom}: {e}")
+            sent, error = await self._send_client(data_mcp, client, state)
+            if error:
+                errors.append(error)
+                continue
+            impresos.append(f"{nom} x{copies}")
+            total_copies += copies
+            for linia in client.get("linies", []):
+                nom_art = linia.get("nm") or linia.get("artName") or linia.get("name") or str(linia.get("art", "?"))
+                qty = linia.get("requested", 0)
+                if qty > 0:
+                    totals_articles[nom_art] = totals_articles.get(nom_art, 0) + qty
 
         totals_lines = sorted(totals_articles.items(), key=lambda x: x[0].lower())
         totals_txt = ""
@@ -190,9 +227,16 @@ class AutoSender:
 
         self.logger.info("Auto enviament completat: %d clients, %d copies", len(impresos), total_copies)
         if errors:
-            self.mark_failed(data_mcp, "; ".join(errors[:10]))
+            self.write_state(data_mcp, {
+                "status": "partial", "clients": state.get("clients", {}),
+                "error": "; ".join(errors[:10]), "sent_clients": len(impresos),
+                "copies": total_copies,
+            })
         else:
-            self.mark_success(data_mcp, clients=len(impresos), copies=total_copies)
+            self.write_state(data_mcp, {
+                "status": "success", "clients": state.get("clients", {}),
+                "sent_clients": len(impresos), "copies": total_copies,
+            })
         await self.notify_all_users(bot, summary)
 
         if totals_lines:

@@ -1,4 +1,6 @@
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+import re
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 
@@ -8,6 +10,8 @@ AF_CLIENT, AF_CLIENT_OPCIO, AF_DATA, AF_PRODUCTE, AF_PRODUCTE_OPCIO, AF_QUANTITA
 def build_afegir_handler(**deps) -> ConversationHandler:
     logger = deps["logger"]
     mcp = deps["mcp"]
+    order_service = deps["order_service"]
+    client_resolver = deps["client_resolver"]
     autoritzat = deps["autoritzat"]
     rebuig = deps["rebuig"]
     is_admin = deps["is_admin"]
@@ -16,11 +20,70 @@ def build_afegir_handler(**deps) -> ConversationHandler:
     parse_data = deps["parse_data"]
     to_mcp_date = deps["to_mcp_date"]
     normalize_search_text = deps["normalize_search_text"]
+    rank_article_options = deps["rank_article_options"]
     fallback_article_options = deps["fallback_article_options"]
     manual_order_text = deps["manual_order_text"]
     manual_order_keyboard = deps["manual_order_keyboard"]
     cmd_stop = deps["cmd_stop"]
     cmd_cancel = deps["cmd_cancel"]
+    get_copies = deps.get("get_copies")
+    auto_sender = deps.get("auto_sender")
+
+    async def existing_special_order(data_mcp: str, client_code: int, article_code: int) -> dict | None:
+        linies = await mcp.linies_article_comanda(data_mcp, client_code, article_code)
+        for line in linies:
+            if int(line.get("order_type", 1) or 1) != 2:
+                continue
+            if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0):
+                return line
+        return None
+
+    def duplicate_text(pending: dict) -> str:
+        existing = int(pending.get("existing_quantity", 0) or 0)
+        new = int(pending.get("new_quantity", pending.get("quantity", 0)) or 0)
+        return (
+            "⚠️ *Aquest producte ja té un encàrrec.*\n\n"
+            f"👤 Client: *{pending.get('client_name')}*\n"
+            f"📅 Data: *{pending.get('date_display')}*\n"
+            f"🥖 Producte: *{pending.get('article_name')}*\n"
+            f"📦 Encàrrec existent: *{existing}*\n"
+            f"➕ Nou encàrrec escrit: *{new}*\n\n"
+            "Quina quantitat total vols deixar?"
+        )
+
+    def duplicate_keyboard(pending: dict) -> ReplyKeyboardMarkup:
+        existing = int(pending.get("existing_quantity", 0) or 0)
+        new = int(pending.get("new_quantity", pending.get("quantity", 0)) or 0)
+        return ReplyKeyboardMarkup(
+            [[f"✅ Deixar {existing + new} en total", f"↩️ Substituir per {new}"], ["❌ Cancel·lar"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+
+    def printed_before(data_mcp: str, client_code: int) -> bool:
+        if not auto_sender:
+            return False
+        state = auto_sender.read_state(data_mcp) or {}
+        client_state = (state.get("clients") or {}).get(str(client_code)) or {}
+        return client_state.get("status") == "success"
+
+    async def warn_printed_if_needed(message, data_mcp: str, client_code: int, client_name: str,
+                                    date_display: str, article_name: str, quantity: int) -> None:
+        if not printed_before(data_mcp, client_code):
+            return
+        copies = get_copies(client_code) if get_copies else 2
+        await message.reply_text(
+            "⚠️ *Has modificat una comanda ja impresa.*\n\n"
+            f"👤 Client: *{client_name}*\n"
+            f"📅 Data: *{date_display}*\n"
+            f"🥖 Producte: *{article_name}*\n"
+            f"🔢 Quantitat final: *{quantity}*\n\n"
+            f"Cal reimprimir l'albarà amb les còpies configurades del client: *{copies}*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"🖨️ Reimprimir albarà ({copies} còpia/es)", callback_data=f"reprint_order:{data_mcp}:{client_code}")
+            ]]),
+        )
 
     async def af_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not autoritzat(update):
@@ -48,11 +111,7 @@ def build_afegir_handler(**deps) -> ConversationHandler:
     async def af_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         cerca_msg = await update.message.reply_text("🔍 Cercant client...")
-        try:
-            resultats = await mcp.cercar_client(text)
-        except Exception as e:
-            logger.warning("af_client: cercar_client excepció: %s", e)
-            resultats = []
+        resultats = [{"n": name, "c": code} for name, code in await client_resolver.resolve(text)]
         try:
             await cerca_msg.delete()
         except Exception:
@@ -65,29 +124,18 @@ def build_afegir_handler(**deps) -> ConversationHandler:
             await update.message.reply_text("❌ Client no trobat. Prova amb un nom diferent:", parse_mode="Markdown")
             return AF_CLIENT
 
-        text_lower = text.lower()
-        coincidencies = [(n, c) for n, c in opcions if text_lower in n.lower()]
-        if len(coincidencies) == 1:
-            name, code = coincidencies[0]
+        text_norm = normalize_search_text(text)
+        exactes = [(n, c) for n, c in opcions if normalize_search_text(n) == text_norm]
+        coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in normalize_search_text(n)]
+        if len(exactes) == 1:
+            name, code = exactes[0]
             context.user_data["client"] = name
             context.user_data["client_code"] = code
             await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
             return await demanar_data(update)
 
-        if len(opcions) == 1:
-            name, code = opcions[0]
-            context.user_data["client"] = name
-            context.user_data["client_code"] = code
-            await update.message.reply_text(f"✅ Client: *{name}*", parse_mode="Markdown")
-            return await demanar_data(update)
-
-        llista = coincidencies if len(coincidencies) > 1 else opcions
-        if len(llista) > 8:
-            await update.message.reply_text(
-                f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del client:",
-                parse_mode="Markdown",
-            )
-            return AF_CLIENT
+        llista = coincidencies if coincidencies else opcions
+        llista = llista[:8]
 
         context.user_data["client_opcions"] = {n: c for n, c in llista}
         keyboard = [[n] for n, _ in llista]
@@ -152,12 +200,18 @@ def build_afegir_handler(**deps) -> ConversationHandler:
             logger.warning("af_producte: cercar_article excepció: %s", e)
             resultats = []
         fallback_used = False
-        if not resultats:
+        query_tokens = set(normalize_search_text(text).split())
+        structural_query = query_tokens.intersection({"1/2", "1/4", "kg", "rodo", "xusco"})
+        if not resultats or structural_query:
             try:
                 fallback_options = await fallback_article_options(text)
                 if fallback_options:
-                    fallback_used = True
-                    resultats = [{"n": name, "c": code} for name, code in fallback_options]
+                    fallback_used = not resultats
+                    resultats = resultats + [
+                        {"n": name, "c": code}
+                        for name, code in fallback_options
+                        if not any(existing.get("c") == code for existing in resultats)
+                    ]
                     logger.info("af_producte: fallback cataleg per %r -> %s", text, fallback_options)
             except Exception as e:
                 logger.warning("af_producte: fallback cataleg excepcio per %r: %s", text, e)
@@ -167,6 +221,7 @@ def build_afegir_handler(**deps) -> ConversationHandler:
             pass
 
         opcions = [(r["n"], r["c"]) for r in resultats if "n" in r and "c" in r]
+        opcions = rank_article_options(text, opcions)
         logger.info("af_producte: %s opcions per %r: %s", len(opcions), text, opcions)
         if not opcions:
             await update.message.reply_text("❌ Producte no trobat. Prova amb un nom diferent:", parse_mode="Markdown")
@@ -174,27 +229,19 @@ def build_afegir_handler(**deps) -> ConversationHandler:
 
         text_norm = normalize_search_text(text)
         coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in normalize_search_text(n)]
-        if len(coincidencies) == 1:
-            name, code = coincidencies[0]
+        exactes = [(n, c) for n, c in opcions if normalize_search_text(n) == text_norm]
+        if len(exactes) == 1 and len(coincidencies) == 1:
+            name, code = exactes[0]
             context.user_data["producte"] = name
             context.user_data["article_code"] = code
+            logger.info("af_producte: auto seleccionat %r -> (%s, %s)", text, name, code)
             await update.message.reply_text(f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?", parse_mode="Markdown")
             return AF_QUANTITAT
 
-        if len(opcions) == 1:
-            name, code = opcions[0]
-            context.user_data["producte"] = name
-            context.user_data["article_code"] = code
-            await update.message.reply_text(f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?", parse_mode="Markdown")
-            return AF_QUANTITAT
-
-        llista = coincidencies if len(coincidencies) > 1 else opcions
-        if len(llista) > 8:
-            await update.message.reply_text(
-                f"⚠️ Massa resultats ({len(llista)}) per «{text}».\nConcreta millor el nom del producte:",
-                parse_mode="Markdown",
-            )
-            return AF_PRODUCTE
+        # Amb mides/tipus, el rànquing per paraules clau és més fiable que exigir
+        # que tota la frase aparegui seguida al nom de l'article.
+        llista = opcions if structural_query else (coincidencies if coincidencies else opcions)
+        llista = llista[:8]
 
         context.user_data["article_opcions"] = {n: c for n, c in llista}
         keyboard = [[n] for n, _ in llista]
@@ -220,6 +267,7 @@ def build_afegir_handler(**deps) -> ConversationHandler:
         code = opcions.get(text)
         context.user_data["producte"] = text
         context.user_data["article_code"] = code
+        logger.info("af_producte_opcio: seleccionat %r -> (%s, %s)", text, text, code)
         await update.message.reply_text(
             f"✅ Producte: *{text}*\n\n🔢 Quina *quantitat*?",
             parse_mode="Markdown",
@@ -253,20 +301,64 @@ def build_afegir_handler(**deps) -> ConversationHandler:
         logger.info(
             "manual_order_prompt mode=add user=%s pending=%s fields=%s",
             update.effective_user.id if update.effective_user else None,
-            {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
+            {k: pending.get(k) for k in ("client_code", "date_mcp", "article_name", "article_code", "quantity")},
             sorted(pending["fields"]),
         )
         await update.message.reply_text(manual_order_text(pending), parse_mode="Markdown", reply_markup=manual_order_keyboard(pending))
-        return ConversationHandler.END
+        return AF_CONFIRMAR
 
     async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         reply_markup = ReplyKeyboardRemove()
+        text_lower = text.lower()
+
+        duplicate_pending = context.user_data.get("pending_duplicate_special_order")
+        if duplicate_pending:
+            if "❌" in text or "cancel" in text_lower:
+                context.user_data.pop("pending_duplicate_special_order", None)
+                await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
+                return ConversationHandler.END
+            existing = int(duplicate_pending.get("existing_quantity", 0) or 0)
+            new = int(duplicate_pending.get("new_quantity", 0) or 0)
+            if "substituir" in text_lower:
+                total_quantity = new
+            else:
+                match = re.search(r"\d+", text)
+                if not match:
+                    await update.message.reply_text(
+                        "⚠️ Escriu la quantitat total o tria un botó.",
+                        reply_markup=duplicate_keyboard(duplicate_pending),
+                    )
+                    return AF_CONFIRMAR
+                total_quantity = int(match.group(0))
+            if total_quantity <= 0:
+                await update.message.reply_text("⚠️ La quantitat total ha de ser positiva.")
+                return AF_CONFIRMAR
+            context.user_data.pop("pending_duplicate_special_order", None)
+            context.user_data["quantitat"] = total_quantity
+            context.user_data["duplicate_special_order_summary"] = {
+                "existing": existing,
+                "new": new,
+                "total": total_quantity,
+            }
+            text_lower = "encarreg"
+
+        if "altre" in text_lower and ("sí" in text_lower or "si" in text_lower):
+            for key in ("producte", "article_code", "quantitat", "pending_order_edit"):
+                context.user_data.pop(key, None)
+            await update.message.reply_text("🥖 Quin *producte*?", parse_mode="Markdown", reply_markup=reply_markup)
+            return AF_PRODUCTE
+
+        if "acabar" in text_lower:
+            context.user_data.clear()
+            await update.message.reply_text("🏁 Procés acabat.", reply_markup=reply_markup)
+            return ConversationHandler.END
+
         if "❌" in text or "cancel" in text.lower():
             await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
             return ConversationHandler.END
 
-        encarreg = "encarreg" in text.lower()
+        encarreg = "encarreg" in text_lower
         order_type = 2 if encarreg else 1
         d = context.user_data
         client_code = d.get("client_code")
@@ -275,18 +367,57 @@ def build_afegir_handler(**deps) -> ConversationHandler:
             await update.message.reply_text("❌ Error intern: no tinc els codis. Torna a iniciar /afegir.", reply_markup=reply_markup)
             return ConversationHandler.END
 
+        data_mcp = to_mcp_date(d["data"])
+        if encarreg and not context.user_data.get("duplicate_special_order_summary"):
+            existing = await existing_special_order(data_mcp, client_code, article_code)
+            if existing:
+                existing_quantity = int(existing.get("served", existing.get("requested", 0)) or 0)
+                pending_duplicate = {
+                    **context.user_data.get("pending_order_edit", {}),
+                    "client_name": d["client"],
+                    "client_code": client_code,
+                    "date_display": d["data"],
+                    "date_mcp": data_mcp,
+                    "article_name": d["producte"],
+                    "article_code": article_code,
+                    "quantity": d["quantitat"],
+                    "new_quantity": d["quantitat"],
+                    "existing_quantity": existing_quantity,
+                }
+                context.user_data["pending_duplicate_special_order"] = pending_duplicate
+                await update.message.reply_text(
+                    duplicate_text(pending_duplicate),
+                    parse_mode="Markdown",
+                    reply_markup=duplicate_keyboard(pending_duplicate),
+                )
+                return AF_CONFIRMAR
+
         await update.message.reply_text(
             f"⏳ {'Encarregant' if encarreg else 'Afegint'} *{d['producte']}* x{d['quantitat']} a *{d['client']}*...",
             parse_mode="Markdown",
             reply_markup=reply_markup,
         )
-        result = await mcp.afegir_linia_mcp(to_mcp_date(d["data"]), client_code, article_code, d["quantitat"], order_type)
+        result = await order_service.add_line(data_mcp, client_code, article_code, d["quantitat"], order_type)
         if result.get("ok", False):
             etiqueta = "Encarreg" if encarreg else "Afegit"
+            duplicate_summary = context.user_data.pop("duplicate_special_order_summary", None)
             await update.message.reply_text(
-                f"✅ *{etiqueta} correctament!*\n\n👤 {d['client']}\n📅 {d['data']}\n🥖 {d['producte']} × {d['quantitat']}",
+                f"✅ *{etiqueta} correctament!*\n\n👤 {d['client']}\n📅 {d['data']}\n🥖 {d['producte']} × {d['quantitat']}\n\n"
+                + (
+                    f"📦 Encàrrec anterior: {duplicate_summary['existing']}\n"
+                    f"➕ Nou encàrrec: {duplicate_summary['new']}\n"
+                    f"🔢 Total deixat: {duplicate_summary['total']}\n\n"
+                    if duplicate_summary else ""
+                )
+                + "Vols afegir algun producte més al mateix client i data?",
                 parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup(
+                    [["✅ Sí, un altre", "🏁 Acabar"]],
+                    one_time_keyboard=True,
+                    resize_keyboard=True,
+                ),
             )
+            await warn_printed_if_needed(update.message, data_mcp, client_code, d["client"], d["data"], d["producte"], d["quantitat"])
         else:
             await update.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
         return ConversationHandler.END

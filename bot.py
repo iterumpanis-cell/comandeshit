@@ -35,8 +35,12 @@ from mcp_vendes import MCPVendes
 from printer import _format_totals_escpos, imprimir_text_directe
 from services.auth import AuthStore, normalize_phone
 from services.auto_send import AutoSender
+from services.client_resolver import ClientResolver
+from services.order_service import OrderService
 from telegram_handlers.ai_chat import register_ai_chat_handlers
 from telegram_handlers.callbacks import register_callback_handlers
+from services.html_order_delete import delete_order_line_html
+from services.html_order_update import update_order_line_html
 from telegram_handlers.ia_admin import register_ia_admin_handlers
 from telegram_handlers.orders_add import build_afegir_handler
 from telegram_handlers.orders_delete import build_esborrar_handler
@@ -125,6 +129,8 @@ def _get_copies(client_code: int) -> int:
 
 # Instàncies globals
 mcp = MCPVendes()
+client_resolver = ClientResolver(mcp, logger)
+order_service = OrderService(mcp, logger)
 
 ai = GeminiHitAssistant(
     config.GEMINI_API_KEY,
@@ -228,6 +234,18 @@ def _order_field_buttons(selected, prefix: str) -> list[list[InlineKeyboardButto
 
 
 def _manual_order_text(pending: dict) -> str:
+    if pending.get("mode") == "delete":
+        return (
+            "⚠️ *Confirma l'esborrament de la línia*\n\n"
+            f"👤 Client: *{pending.get('client_name')}*\n"
+            f"📅 Data: *{pending.get('date_display')}*\n"
+            f"🥖 Producte: *{pending.get('article_name')}*\n"
+            f"📌 Demanat: *{pending.get('requested', 0)}*  "
+            f"Servit: *{pending.get('served', 0)}*  "
+            f"Tornat: *{pending.get('returned', 0)}*\n"
+            f"🔖 Tipus: *{pending.get('order_type', 1)}*\n\n"
+            "S'obrirà la web HTML i es clicarà la paperera d'aquesta línia."
+        )
     action = "posar a 0" if pending.get("quantity") == 0 else f"posar a {pending.get('quantity')}"
     return (
         f"*Quins camps vols canviar?*\n\n"
@@ -242,7 +260,7 @@ def _manual_order_text(pending: dict) -> str:
 def _manual_order_keyboard(pending: dict) -> InlineKeyboardMarkup:
     rows = _order_field_buttons(pending.get("fields", set()), "order")
     if pending.get("mode") == "delete":
-        rows.append([InlineKeyboardButton("🗑️ Esborrar aquests camps", callback_data="order_apply:auto")])
+        rows.append([InlineKeyboardButton("⚠️ Confirmar esborrament", callback_data="order_apply:auto")])
     else:
         rows.append([
             InlineKeyboardButton("✅ Afegir", callback_data="order_apply:1"),
@@ -281,13 +299,15 @@ def _confirmation_text(lines: list, fields) -> str:
     text_lines = ["📋 *Confirmes la comanda?*\n"]
     for line in lines:
         date_fmt = line.get("date", "?")
-        client_name = line.get("client_name", f"codi {line.get('client', '?')}")
+        client_code = line.get("client", "?")
+        client_name = line.get("client_name") or "Client sense validar"
+        client_label = f"{client_name} ({client_code})" if client_code != "?" else client_name
         article_name = line.get("article_name", f"codi {line.get('article_code', '?')}")
         qty = line.get("quantity", 0)
         order_type = line.get("order_type", 1)
         prefix = "🎗️ " if order_type == 2 else "🥖 "
         text_lines.append(f"{prefix}*{article_name}* × {qty}")
-        text_lines.append(f"   👤 {client_name}  📅 {date_fmt}")
+        text_lines.append(f"   👤 {client_label}  📅 {date_fmt}")
     text_lines.append(f"\n📌 Camps: *{_format_order_fields(fields)}*")
     return "\n".join(text_lines)
 
@@ -411,7 +431,33 @@ def _parse_all_orders_date(text: str) -> str | None:
 def _normalize_search_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    return re.sub(r"\s+", " ", without_accents.lower()).strip()
+    normalized_text = re.sub(r"\s*/\s*", "/", without_accents.lower())
+    return re.sub(r"\s+", " ", normalized_text).strip()
+
+
+ARTICLE_STRUCTURAL_KEYWORDS = ("1/2", "1/4", "kg", "rodo", "xusco")
+
+
+def _article_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+(?:/[a-z0-9]+)?", _normalize_search_text(text)))
+
+
+def _rank_article_options(text: str, options: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    query_tokens = _article_tokens(text)
+    structural = query_tokens.intersection(ARTICLE_STRUCTURAL_KEYWORDS)
+    descriptive = query_tokens.difference(ARTICLE_STRUCTURAL_KEYWORDS)
+
+    def sort_key(option: tuple[str, int]) -> tuple[float, int, int, str]:
+        name, _ = option
+        name_tokens = _article_tokens(name)
+        structural_hits = len(structural.intersection(name_tokens))
+        descriptive_hits = len(descriptive.intersection(name_tokens))
+        structural_score = structural_hits / len(structural) if structural else 1.0
+        descriptive_score = descriptive_hits / len(descriptive) if descriptive else 1.0
+        score = structural_score * 0.65 + descriptive_score * 0.3 + _article_match_score(text, name) * 0.05
+        return (-score, -structural_hits, -descriptive_hits, name.lower())
+
+    return sorted(options, key=sort_key)
 
 
 def _article_match_score(query: str, article_name: str) -> float:
@@ -431,7 +477,7 @@ def _article_match_score(query: str, article_name: str) -> float:
     return max(ratio, token_score)
 
 
-async def _fallback_article_options(text: str, limit: int = 8) -> list[tuple[str, int]]:
+async def _fallback_article_options(text: str, limit: int = 20) -> list[tuple[str, int]]:
     articles = await mcp.llistar_tots_articles()
     ranked = []
     for item in articles:
@@ -444,7 +490,7 @@ async def _fallback_article_options(text: str, limit: int = 8) -> list[tuple[str
             ranked.append((score, str(name), int(code)))
 
     ranked.sort(key=lambda item: (-item[0], item[1].lower()))
-    return [(name, code) for _, name, code in ranked[:limit]]
+    return _rank_article_options(text, [(name, code) for _, name, code in ranked[:limit]])
 
 
 def _is_print_request(text: str) -> bool:
@@ -1538,6 +1584,8 @@ def run_bot():
     afegir_handler = build_afegir_handler(
         logger=logger,
         mcp=mcp,
+        client_resolver=client_resolver,
+        order_service=order_service,
         autoritzat=autoritzat,
         rebuig=rebuig,
         is_admin=_is_admin,
@@ -1546,9 +1594,12 @@ def run_bot():
         parse_data=_parse_data,
         to_mcp_date=_to_mcp_date,
         normalize_search_text=_normalize_search_text,
+        rank_article_options=_rank_article_options,
         fallback_article_options=_fallback_article_options,
         manual_order_text=_manual_order_text,
         manual_order_keyboard=_manual_order_keyboard,
+        get_copies=_get_copies,
+        auto_sender=auto_sender,
         cmd_stop=cmd_stop,
         cmd_cancel=cmd_cancel,
     )
@@ -1556,6 +1607,8 @@ def run_bot():
     veure_handler = build_veure_handler(
         logger=logger,
         mcp=mcp,
+        client_resolver=client_resolver,
+        order_service=order_service,
         autoritzat=autoritzat,
         rebuig=rebuig,
         is_admin=_is_admin,
@@ -1564,6 +1617,7 @@ def run_bot():
         parse_data=_parse_data,
         to_mcp_date=_to_mcp_date,
         format_order_ticket=_format_order_ticket,
+        html_delete_line=delete_order_line_html,
         cmd_stop=cmd_stop,
         cmd_cancel=cmd_cancel,
     )
@@ -1571,6 +1625,8 @@ def run_bot():
     esborrar_handler = build_esborrar_handler(
         logger=logger,
         mcp=mcp,
+        client_resolver=client_resolver,
+        order_service=order_service,
         autoritzat=autoritzat,
         rebuig=rebuig,
         is_admin=_is_admin,
@@ -1578,8 +1634,10 @@ def run_bot():
         keyboard_dates=_keyboard_dates,
         parse_data=_parse_data,
         to_mcp_date=_to_mcp_date,
+        normalize_search_text=_normalize_search_text,
         manual_order_text=_manual_order_text,
         manual_order_keyboard=_manual_order_keyboard,
+        html_update_line=update_order_line_html,
         tancar_estat=_tancar_estat,
         cmd_stop=cmd_stop,
         cmd_cancel=cmd_cancel,
@@ -1681,9 +1739,11 @@ def run_bot():
         confirmation_text=_confirmation_text,
         confirmation_keyboard=_confirmation_keyboard,
         format_order_ticket=_format_order_ticket,
+        html_delete_line=delete_order_line_html,
         load_auth_data=_load_auth_data,
         save_auth_data=_save_auth_data,
         get_admin_user_id=_get_admin_user_id,
+        get_copies=_get_copies,
         base_dir=Path(__file__).resolve().parent,
     )
     app.add_error_handler(error_handler)

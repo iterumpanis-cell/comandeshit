@@ -55,7 +55,17 @@ def _looks_operational_ai_request(text: str) -> bool:
     t = _normalize_plain_text(text)
     problem_words = ("problema", "falla", "fallat", "error", "arregla", "arreglal", "mcp", "automatic", "automatica")
     action_words = ("envia", "enviar", "imprimeix", "imprimir", "comandes", "albarans")
-    return any(w in t for w in problem_words) and any(w in t for w in action_words)
+    if any(w in t for w in problem_words) and any(w in t for w in action_words):
+        return True
+
+    # Una ordre global d'enviament no ha de passar pel flux de comanda individual.
+    has_global_target = any(w in t for w in ("totes", "tots", "clients", "albarans", "comandes"))
+    has_order = any(w in t for w in ("comand", "albar"))
+    has_send_action = any(w in t for w in ("envia", "enviar", "imprimeix", "imprimir"))
+    has_date = bool(__import__("re").search(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", t)) or any(
+        w in t for w in ("avui", "demà", "dema", "hoy", "mañana", "manana")
+    )
+    return has_global_target and has_order and has_send_action and has_date
 
 
 def _parse_operational_date(text: str) -> tuple[str, str]:
