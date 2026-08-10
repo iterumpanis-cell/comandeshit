@@ -3,10 +3,12 @@ mcp_vendes.py — Client MCP per al servidor de vendes d'octomes.com
 Protocol: MCP Streamable HTTP amb sessions (mcp-session-id header)
 """
 import asyncio
+import difflib
 import json
 import logging
 import os
 import time
+import unicodedata
 import aiohttp
 from dotenv import load_dotenv
 
@@ -26,6 +28,23 @@ def _parse_sse(text: str) -> dict | None:
             except Exception:
                 pass
     return None
+
+
+def _normalize_client_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return " ".join(without_accents.lower().split())
+
+
+def _client_match_score(query: str, name: str) -> float:
+    if not query or not name:
+        return 0.0
+    if query in name or name in query:
+        return 0.9
+    query_tokens = set(query.split())
+    name_tokens = set(name.split())
+    token_score = len(query_tokens & name_tokens) / len(query_tokens) if query_tokens else 0.0
+    return max(token_score, difflib.SequenceMatcher(None, query, name).ratio())
 
 
 class MCPVendes:
@@ -135,10 +154,9 @@ class MCPVendes:
     # ------------------------------------------------------------------ #
 
     async def cercar_client(self, text: str) -> list:
-        """Cerca clients per nom. Si no troba res, reintenta truncant l'últim caràcter
-        fins a 3 cops (workaround per accents: 'Cabre' → 'Cabr' → troba 'Cabré')."""
+        """Cerca clients per nom i ofereix candidats aproximats si cal."""
         try:
-            for i in range(min(4, len(text) - 2)):
+            for i in range(min(2, len(text) - 2)):
                 query = text[:len(text) - i] if i > 0 else text
                 if len(query) < 3:
                     break
@@ -148,7 +166,24 @@ class MCPVendes:
                     if i > 0:
                         logger.info(f"cercar_client: fallback '{text}'->'{query}', {len(results)} resultats")
                     return results
-            return []
+            # Fallback local per errades, accents o noms parcials que el cercador
+            # SQL no resol. Es limita a candidats per poder-los triar al bot.
+            clients = await self.llistar_tots_clients()
+            query_norm = _normalize_client_text(text)
+            candidates = []
+            for client in clients:
+                name = client.get("n") or client.get("name")
+                code = client.get("c") or client.get("code")
+                if not name or code is None:
+                    continue
+                score = _client_match_score(query_norm, _normalize_client_text(str(name)))
+                if score >= 0.42:
+                    candidates.append((score, str(name), code))
+
+            candidates.sort(key=lambda item: (-item[0], item[1].lower()))
+            result = [{"n": name, "c": code} for _, name, code in candidates[:8]]
+            logger.info("cercar_client: fallback aproximat '%s', %d candidats", text, len(result))
+            return result
         except Exception as e:
             logger.warning(f"cercar_client: {e}")
             return []
@@ -285,6 +320,19 @@ class MCPVendes:
             data, client, article_code, order_type,
             requested_quantity=quantity,
             served_quantity=quantity,
+        )
+
+    async def anul_linia_mcp(self, data: str, client: int, article_code: int,
+                             order_type: int) -> dict:
+        """Anul·la una línia posant totes les quantitats a zero; no fa DELETE."""
+        return await self.canviar_linia_mcp(
+            data,
+            client,
+            article_code,
+            order_type,
+            requested_quantity=0,
+            served_quantity=0,
+            returned_quantity=0,
         )
 
     async def llistar_clients_amb_comanda(self, data: str) -> list:

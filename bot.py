@@ -119,6 +119,41 @@ def _get_copies(client_code: int) -> int:
     except Exception:
         return 2
 
+
+def _auto_envia_client_success(data_mcp: str, client_code: int) -> dict | None:
+    state = _read_auto_envia_state(data_mcp) or {}
+    client_state = (state.get("clients") or {}).get(str(client_code)) or {}
+    if client_state.get("status") == "success":
+        return client_state
+    return None
+
+
+def _reprint_keyboard(data_mcp: str, client_code: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"🖨️ Reimprimir albarà ({_get_copies(client_code)} còpia/es)",
+            callback_data=f"reprint_order:{data_mcp}:{client_code}",
+        )
+    ]])
+
+
+async def _warn_printed_order_if_needed(message, data_mcp: str, client_code: int, client_name: str,
+                                       data_display: str, article_name: str, quantity: int) -> None:
+    sent = _auto_envia_client_success(data_mcp, client_code)
+    if not sent:
+        return
+    copies = _get_copies(client_code)
+    await message.reply_text(
+        "⚠️ *Has modificat una comanda ja impresa.*\n\n"
+        f"👤 Client: *{client_name}*\n"
+        f"📅 Data: *{data_display}*\n"
+        f"🥖 Producte: *{article_name}*\n"
+        f"🔢 Quantitat final: *{quantity}*\n\n"
+        f"Cal reimprimir l'albarà amb les còpies configurades del client: *{copies}*.",
+        parse_mode="Markdown",
+        reply_markup=_reprint_keyboard(data_mcp, client_code),
+    )
+
 # ------------------------------------------------------------------ #
 #  Estats de la conversa                                              #
 # ------------------------------------------------------------------ #
@@ -338,6 +373,55 @@ def _order_type_choice_keyboard(pending: dict, linies: list[dict]) -> InlineKeyb
         )])
     rows.append([InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _existing_special_order(data_mcp: str, client_code: int, article_code: int) -> dict | None:
+    linies = await mcp.linies_article_comanda(data_mcp, client_code, article_code)
+    for line in linies:
+        if int(line.get("order_type", 1) or 1) != 2:
+            continue
+        if line.get("requested", 0) or line.get("served", 0) or line.get("returned", 0):
+            return line
+    return None
+
+
+def _duplicate_special_order_text(pending: dict) -> str:
+    existing = int(pending.get("existing_quantity", 0) or 0)
+    new = int(pending.get("new_quantity", pending.get("quantity", 0)) or 0)
+    suggested = existing + new
+    return (
+        "⚠️ *Aquest producte ja té un encàrrec.*\n\n"
+        f"👤 Client: *{pending.get('client_name')}*\n"
+        f"📅 Data: *{pending.get('date_display')}*\n"
+        f"🥖 Producte: *{pending.get('article_name')}*\n"
+        f"📦 Encàrrec existent: *{existing}*\n"
+        f"➕ Nou encàrrec escrit: *{new}*\n\n"
+        "Quina quantitat total vols deixar?"
+    )
+
+
+def _duplicate_special_order_keyboard(pending: dict) -> ReplyKeyboardMarkup:
+    existing = int(pending.get("existing_quantity", 0) or 0)
+    new = int(pending.get("new_quantity", pending.get("quantity", 0)) or 0)
+    suggested = existing + new
+    return ReplyKeyboardMarkup(
+        [[f"✅ Deixar {suggested} en total", f"↩️ Substituir per {new}"], ["❌ Cancel·lar"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+
+
+def _duplicate_special_order_inline_keyboard(pending: dict) -> InlineKeyboardMarkup:
+    existing = int(pending.get("existing_quantity", 0) or 0)
+    new = int(pending.get("new_quantity", pending.get("quantity", 0)) or 0)
+    suggested = existing + new
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✅ Deixar {suggested} en total", callback_data=f"order_total:{suggested}"),
+            InlineKeyboardButton(f"↩️ Substituir per {new}", callback_data=f"order_total:{new}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel·lar", callback_data="order_cancel")],
+    ])
 
 
 def _confirmation_text(lines: list, fields) -> str:
@@ -1940,6 +2024,59 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     data = query.data
 
+    if data.startswith("reprint_order:"):
+        try:
+            _, data_mcp, client_raw = data.split(":", 2)
+            client_code = int(client_raw)
+        except Exception:
+            await query.edit_message_text("❌ No puc identificar l'albarà a reimprimir.")
+            return
+        copies = _get_copies(client_code)
+        await query.edit_message_text(f"⏳ Reimprimint albarà ({copies} còpia/es)...")
+        result = await mcp.imprimir_albarans(data_mcp, client_code, copies)
+        if isinstance(result, dict) and not result.get("error"):
+            await query.message.reply_text(f"✅ Albarà reimprès amb {copies} còpia/es.")
+        else:
+            await query.message.reply_text(f"❌ Error reimprimint: {(result or {}).get('error', 'Error desconegut')}")
+        return
+
+    if data.startswith("order_total:"):
+        pending = context.user_data.pop("pending_order_edit", None)
+        if not pending:
+            await query.edit_message_text("❌ No hi ha cap canvi pendent.")
+            return
+        try:
+            total_quantity = int(data.split(":", 1)[1])
+        except ValueError:
+            await query.edit_message_text("❌ Quantitat no vàlida.")
+            return
+        fields = set(pending.get("fields", {"requested", "served"}))
+        kwargs = {ORDER_FIELD_KWARGS[f]: total_quantity for f in fields}
+        await query.edit_message_text("⏳ Aplicant total d'encàrrec...")
+        result = await order_service.update_line(
+            pending["date_mcp"], pending["client_code"], pending["article_code"], 2, **kwargs
+        )
+        if result.get("ok"):
+            await query.message.reply_text(
+                f"✅ Encàrrec actualitzat correctament.\n\n"
+                f"👤 {pending['client_name']}\n"
+                f"📅 {pending['date_display']}\n"
+                f"🥖 {pending['article_name']}\n"
+                f"🔢 Total deixat: {total_quantity}"
+            )
+            await _warn_printed_order_if_needed(
+                query.message,
+                pending["date_mcp"],
+                pending["client_code"],
+                pending["client_name"],
+                pending["date_display"],
+                pending["article_name"],
+                total_quantity,
+            )
+        else:
+            await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
+        return
+
     if data.startswith("order_field:"):
         pending = context.user_data.get("pending_order_edit")
         if not pending:
@@ -2027,6 +2164,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 order_type = 1
         else:
             order_type = int(order_type_raw)
+        if pending.get("mode") == "add" and order_type == 2:
+            existing = await _existing_special_order(
+                pending["date_mcp"],
+                pending["client_code"],
+                pending["article_code"],
+            )
+            if existing:
+                existing_quantity = int(existing.get("served", existing.get("requested", 0)) or 0)
+                pending["existing_quantity"] = existing_quantity
+                pending["new_quantity"] = quantity
+                context.user_data["pending_order_edit"] = pending
+                await query.edit_message_text(
+                    _duplicate_special_order_text(pending),
+                    parse_mode="Markdown",
+                    reply_markup=_duplicate_special_order_inline_keyboard(pending),
+                )
+                return
         logger.info(
             "order_apply user=%s order_type=%s fields=%s kwargs=%s pending=%s",
             query.from_user.id,
@@ -2057,6 +2211,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     one_time_keyboard=True,
                     resize_keyboard=True,
                 ),
+            )
+            await _warn_printed_order_if_needed(
+                query.message,
+                pending["date_mcp"],
+                pending["client_code"],
+                pending["client_name"],
+                pending["date_display"],
+                pending["article_name"],
+                quantity,
             )
         else:
             await query.message.reply_text(f"❌ Error MCP: {result.get('error', 'Error desconegut')}")
@@ -2256,6 +2419,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     continue
                 order_type = forced_order_type if forced_order_type in (1, 2) else line.get("order_type", 1)
+                if int(order_type or 1) == 2:
+                    existing = await _existing_special_order(line["date"], line["client"], line["article_code"])
+                    if existing:
+                        existing_quantity = int(existing.get("served", existing.get("requested", 0)) or 0)
+                        errors.append(
+                            f"⚠️ {line.get('article_name', '?')}: ja hi ha un encàrrec de {existing_quantity}. "
+                            "Fes-ho amb /afegir perquè el bot et pregunti quin total vols deixar."
+                        )
+                        continue
                 logger.info(
                     "confirm_apply user=%s order_type=%s fields=%s line=%s",
                     query.from_user.id,
@@ -2306,6 +2478,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     chat_id=query.message.chat_id,
                     text=ticket,
                     parse_mode="HTML",
+                )
+            for line in results:
+                data_mcp = line.get("date", "?")
+                client_code = int(line.get("client"))
+                await _warn_printed_order_if_needed(
+                    query.message,
+                    data_mcp,
+                    client_code,
+                    line.get("client_name") or str(client_code),
+                    _from_mcp_date(data_mcp) if re.match(r"^\d{4}-\d{2}-\d{2}$", data_mcp) else data_mcp,
+                    line.get("article_name") or f"codi {line.get('article_code', '?')}",
+                    int(line.get("quantity", 0) or 0),
                 )
 
         if errors:
@@ -2484,10 +2668,11 @@ async def af_producte(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coincidencies = [(n, c) for n, c in opcions if text_norm and text_norm in _normalize_search_text(n)]
 
     exactes = [(n, c) for n, c in opcions if _normalize_search_text(n) == text_norm]
-    if len(exactes) == 1:
+    if len(exactes) == 1 and len(coincidencies) == 1:
         name, code = exactes[0]
         context.user_data["producte"] = name
         context.user_data["article_code"] = code
+        logger.info("af_producte: auto seleccionat %r -> (%s, %s)", text, name, code)
         await update.message.reply_text(
             f"✅ Producte: *{name}*\n\n🔢 Quina *quantitat*?",
             parse_mode="Markdown",
@@ -2524,6 +2709,7 @@ async def af_producte_opcio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = opcions.get(text)
     context.user_data["producte"] = text
     context.user_data["article_code"] = code
+    logger.info("af_producte_opcio: seleccionat %r -> (%s, %s)", text, text, code)
     await update.message.reply_text(
         f"✅ Producte: *{text}*\n\n🔢 Quina *quantitat*?",
         parse_mode="Markdown",
@@ -2559,7 +2745,7 @@ async def af_quantitat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(
         "manual_order_prompt mode=add user=%s pending=%s fields=%s",
         update.effective_user.id if update.effective_user else None,
-        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_code", "quantity")},
+        {k: pending.get(k) for k in ("client_code", "date_mcp", "article_name", "article_code", "quantity")},
         sorted(pending["fields"]),
     )
     await update.message.reply_text(
@@ -2574,6 +2760,39 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     reply_markup = ReplyKeyboardRemove()
     text_lower = text.lower()
+
+    duplicate_pending = context.user_data.get("pending_duplicate_special_order")
+    if duplicate_pending:
+        if "❌" in text or "cancel" in text_lower:
+            context.user_data.pop("pending_duplicate_special_order", None)
+            await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
+            return ConversationHandler.END
+        existing = int(duplicate_pending.get("existing_quantity", 0) or 0)
+        new = int(duplicate_pending.get("new_quantity", 0) or 0)
+        suggested = existing + new
+        if "substituir" in text_lower:
+            total_quantity = new
+        else:
+            match = re.search(r"\d+", text)
+            if not match:
+                await update.message.reply_text(
+                    "⚠️ Escriu la quantitat total o tria un botó.",
+                    reply_markup=_duplicate_special_order_keyboard(duplicate_pending),
+                )
+                return AF_CONFIRMAR
+            total_quantity = int(match.group(0))
+        if total_quantity <= 0:
+            await update.message.reply_text("⚠️ La quantitat total ha de ser positiva.")
+            return AF_CONFIRMAR
+        context.user_data.pop("pending_duplicate_special_order", None)
+        context.user_data["quantitat"] = total_quantity
+        context.user_data["duplicate_special_order_summary"] = {
+            "existing": existing,
+            "new": new,
+            "total": total_quantity,
+            "suggested": suggested,
+        }
+        text_lower = "encarreg"
 
     if "altre" in text_lower and ("sí" in text_lower or "si" in text_lower):
         for key in ("producte", "article_code", "quantitat", "pending_order_edit"):
@@ -2594,7 +2813,7 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Cancel·lat.", reply_markup=reply_markup)
         return ConversationHandler.END
 
-    encarreg = "encarreg" in text.lower()
+    encarreg = "encarreg" in text_lower
     order_type = 2 if encarreg else 1
     d = context.user_data
 
@@ -2607,13 +2826,37 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    data_mcp = _to_mcp_date(d["data"])
+    if encarreg and not context.user_data.get("duplicate_special_order_summary"):
+        existing = await _existing_special_order(data_mcp, client_code, article_code)
+        if existing:
+            existing_quantity = int(existing.get("served", existing.get("requested", 0)) or 0)
+            pending_duplicate = {
+                **context.user_data.get("pending_order_edit", {}),
+                "client_name": d["client"],
+                "client_code": client_code,
+                "date_display": d["data"],
+                "date_mcp": data_mcp,
+                "article_name": d["producte"],
+                "article_code": article_code,
+                "quantity": d["quantitat"],
+                "new_quantity": d["quantitat"],
+                "existing_quantity": existing_quantity,
+            }
+            context.user_data["pending_duplicate_special_order"] = pending_duplicate
+            await update.message.reply_text(
+                _duplicate_special_order_text(pending_duplicate),
+                parse_mode="Markdown",
+                reply_markup=_duplicate_special_order_keyboard(pending_duplicate),
+            )
+            return AF_CONFIRMAR
+
     await update.message.reply_text(
         f"⏳ {'Encarregant' if encarreg else 'Afegint'} *{d['producte']}* x{d['quantitat']} a *{d['client']}*...",
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
 
-    data_mcp = _to_mcp_date(d["data"])
     result = await order_service.add_line(
         data_mcp, client_code, article_code, d["quantitat"], order_type
     )
@@ -2622,16 +2865,12 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ok:
         etiqueta = "Encarreg" if encarreg else "Afegit"
-        try:
-            print_result = await mcp.imprimir_albarans(data_mcp, client_code, copies=1)
-        except Exception as exc:
-            print_result = {"error": str(exc)}
-            logger.exception("Error reimprimint la comanda modificada client=%s", client_code)
-        print_ok = not print_result.get("error")
+        duplicate_summary = context.user_data.pop("duplicate_special_order_summary", None)
+        printed_before = _auto_envia_client_success(data_mcp, client_code) is not None
         print_status = (
-            "albarà enviat a la impressora"
-            if print_ok
-            else f"error enviant l'albarà a la impressora: {print_result.get('error')}"
+            "comanda ja impresa: pendent de reimprimir amb el botó"
+            if printed_before
+            else "no s'ha reimprès automàticament"
         )
         notification = (
             f"<b>Comanda modificada</b>\n"
@@ -2647,7 +2886,13 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 {d['client']}\n"
             f"📅 {d['data']}\n"
             f"🥖 {d['producte']} × {d['quantitat']}\n\n"
-            f"🖨️ {print_status}\n\n"
+            + (
+                f"📦 Encàrrec anterior: {duplicate_summary['existing']}\n"
+                f"➕ Nou encàrrec: {duplicate_summary['new']}\n"
+                f"🔢 Total deixat: {duplicate_summary['total']}\n\n"
+                if duplicate_summary else ""
+            )
+            + f"🖨️ {print_status}\n\n"
             "Vols afegir algun producte més al mateix client i data?",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardMarkup(
@@ -2655,6 +2900,15 @@ async def af_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 one_time_keyboard=True,
                 resize_keyboard=True,
             ),
+        )
+        await _warn_printed_order_if_needed(
+            update.message,
+            data_mcp,
+            client_code,
+            d["client"],
+            d["data"],
+            d["producte"],
+            d["quantitat"],
         )
     else:
         await update.message.reply_text(f"❌ Error MCP: {error}")
