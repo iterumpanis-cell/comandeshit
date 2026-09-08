@@ -5,6 +5,7 @@ Usa comandes ESC/POS compatibles amb Star.
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,101 @@ def _format_ticket(client_name: str, data: str, linies: list) -> bytes:
     return bytes(buf)
 
 
+def _money(value) -> Decimal:
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _format_ticket_valorat(client_name: str, data: str, linies: list, iva_rate: Decimal = Decimal("0.04")) -> bytes:
+    """Genera un albara valorat amb ordres ESC/POS enviades com a bytes."""
+    buf = bytearray()
+    buf += INIT + ALIGN_CENTER + BOLD_ON + DOUBLE_ON
+    buf += _encode("ITERUM PANIS") + LF
+    buf += DOUBLE_OFF + BOLD_OFF + _encode("Obrador") + LF + LF
+    buf += ALIGN_LEFT + BOLD_ON
+    buf += _encode(f"Client: {client_name}") + LF
+    buf += _encode(f"Data:   {data}") + LF
+    buf += BOLD_OFF + _encode("-" * 40) + LF
+    buf += BOLD_ON + _encode("QTY  ARTICLE") + LF + BOLD_OFF
+    buf += _encode("-" * 40) + LF
+
+    base_total = Decimal("0.00")
+    vat_total = Decimal("0.00")
+    printed = 0
+    for line in linies:
+        qty = Decimal(str(line.get("served", 0) or 0))
+        if qty <= 0:
+            continue
+        name = str(line.get("nm") or line.get("artName") or line.get("name") or "?")
+        price = _money(line.get("price", line.get("p", 0)))
+        base = _money(line.get("amount", line.get("i", price * qty)))
+        vat = _money(base * iva_rate)
+        base_total += base
+        vat_total += vat
+        printed += 1
+        qty_text = f"{qty:g}"
+        buf += _encode(f"{qty_text:>4}  {name[:34]}") + LF
+        buf += _encode(f"      Preu: {price:>7.2f} EUR   Base: {base:>7.2f}") + LF
+        buf += _encode(f"      IVA:  {iva_rate * 100:>6.0f}%    Quota: {vat:>7.2f}") + LF
+
+    if not printed:
+        raise ValueError("La comanda no te linies servides valorables")
+
+    total = base_total + vat_total
+    buf += _encode("-" * 40) + LF
+    buf += BOLD_ON
+    buf += _encode(f"BASE IVA {iva_rate * 100:.0f}%:{base_total:>17.2f} EUR") + LF
+    buf += _encode(f"IVA {iva_rate * 100:.0f}%:{vat_total:>21.2f} EUR") + LF
+    buf += _encode(f"TOTAL ALBARA:{total:>20.2f} EUR") + LF
+    buf += BOLD_OFF + LF + ALIGN_CENTER
+    buf += _encode(datetime.now().strftime("%d/%m/%Y %H:%M")) + LF
+    buf += LF + LF + LF + CUT
+    return bytes(buf)
+
+
+def format_ticket_valorat_text(client_name: str, data: str, linies: list, iva_rate: Decimal = Decimal("0.04")) -> str:
+    """Genera un albara valorat en text net per a la cua CloudPRNT."""
+    lines = [
+        "ITERUM PANIS",
+        "Obrador",
+        "",
+        f"Client: {client_name}",
+        f"Data:   {data}",
+        "----------------------------------------",
+        "QTY  ARTICLE",
+        "----------------------------------------",
+    ]
+    base_total = Decimal("0.00")
+    vat_total = Decimal("0.00")
+    printed = 0
+    for line in linies:
+        qty = Decimal(str(line.get("served", 0) or 0))
+        if qty <= 0:
+            continue
+        name = str(line.get("nm") or line.get("artName") or line.get("name") or "?")
+        price = _money(line.get("price", line.get("p", 0)))
+        base = _money(line.get("amount", line.get("i", price * qty)))
+        vat = _money(base * iva_rate)
+        base_total += base
+        vat_total += vat
+        printed += 1
+        lines.extend([
+            f"{qty:g}  {name}",
+            f"     Preu: {price:.2f} EUR   Base: {base:.2f} EUR",
+            f"     IVA: {iva_rate * 100:.0f}%       Quota: {vat:.2f} EUR",
+        ])
+    if not printed:
+        raise ValueError("La comanda no te linies servides valorables")
+    lines.extend([
+        "----------------------------------------",
+        f"BASE IVA {iva_rate * 100:.0f}%: {base_total:.2f} EUR",
+        f"QUOTA IVA {iva_rate * 100:.0f}%: {vat_total:.2f} EUR",
+        f"TOTAL ALBARA: {base_total + vat_total:.2f} EUR",
+        "",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 async def imprimir_text_directe(text_escpos: str) -> dict:
     """Envia text ESC/POS directament a la impressora per TCP.
     Així evitem la corrupcio de caracters de control per CP1252/JSON del MCP."""
@@ -186,4 +282,28 @@ async def imprimir_albara(client_name: str, data: str, linies: list, copies: int
         return {"error": msg}
     except Exception as e:
         logger.error(f"Error impressió: {e}")
+        return {"error": str(e)}
+
+
+async def imprimir_albara_valorat(client_name: str, data: str, linies: list, copies: int = 1) -> dict:
+    """Envia un albara valorat directament a la Star, sense passar pel MCP."""
+    try:
+        ticket = _format_ticket_valorat(client_name, data, linies)
+        for index in range(copies):
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(PRINTER_IP, PRINTER_PORT),
+                timeout=TIMEOUT,
+            )
+            writer.write(ticket)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            logger.info("Impressio valorada %s/%s enviada: %s (%s)", index + 1, copies, client_name, data)
+        return {"ok": True, "local": True, "copies": copies}
+    except asyncio.TimeoutError:
+        msg = f"Timeout connectant a la impressora {PRINTER_IP}:{PRINTER_PORT}"
+        logger.error(msg)
+        return {"error": msg}
+    except Exception as e:
+        logger.error("Error impressio valorada: %s", e)
         return {"error": str(e)}

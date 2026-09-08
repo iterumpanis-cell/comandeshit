@@ -1,3 +1,6 @@
+import re
+import unicodedata
+
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ChatAction
 from telegram.ext import CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -75,13 +78,27 @@ def build_imprimir_handler(**deps) -> ConversationHandler:
         if "Tots els clients" in text:
             await print_all_orders(update, context.user_data["im_data"])
             return ConversationHandler.END
+        if "Un client concret" in text:
+            await update.message.reply_text(
+                "Escriu el nom del client:",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return IM_CLIENT
+
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         resultats = await mcp.cercar_client(text)
         if not resultats:
             await update.message.reply_text("❌ Client no trobat. Torna a intentar-ho:")
             return IM_CLIENT
-        if len(resultats) == 1:
-            c = resultats[0]
+
+        def normalized(value: str) -> str:
+            plain = unicodedata.normalize("NFKD", value or "")
+            plain = "".join(ch for ch in plain if not unicodedata.combining(ch))
+            return re.sub(r"[^a-z0-9]+", " ", plain.casefold()).strip()
+
+        exact = next((item for item in resultats if normalized(item.get("n", "")) == normalized(text)), None)
+        if exact:
+            c = exact
             context.user_data["im_client"] = {"codi": c["c"], "nom": c["n"]}
             return await im_imprimir(update, context, get_copies(c["c"]))
 
