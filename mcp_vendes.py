@@ -415,6 +415,26 @@ class MCPVendes:
         """Encua impressió d'albarà d'un client via ImpresoraIpAlbaranes.
         El servidor ignora el camp 'copies', per tant fem N crides d'1 còpia."""
         try:
+            valued_clients = {
+                1145: "E. CAN MANENT (3)",
+                1144: "E. DOLORS GRANES (2)",
+                1143: "E. GERMANS CORBELLA (1)",
+                1141: "ESCOLA LA FALGUERA",
+                1130: "GUARDERIA VILANOVA BALDUFA",
+            }
+            if client in valued_clients:
+                from printer import format_ticket_valorat_text
+
+                order = await self.veure_comanda(data, client)
+                if "error" in order:
+                    return order
+                text = format_ticket_valorat_text(valued_clients[client], data, order.get("order", []))
+                last = {}
+                for _ in range(max(1, copies)):
+                    last = await self.imprimir_text(text)
+                    if "error" in last:
+                        return last
+                return {**last, "valued": True, "copies": copies}
             last = {}
             for _ in range(max(1, copies)):
                 last = await self._tool("print_delivery_orders", {"date": data, "client": client, "copies": 1})

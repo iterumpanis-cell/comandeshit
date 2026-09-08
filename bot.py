@@ -38,6 +38,7 @@ from services.client_resolver import ClientResolver
 from services.order_service import OrderService
 from services.html_order_delete import delete_order_line_html
 from services.html_order_update import update_order_line_html
+from services.local_time import local_today
 
 # ------------------------------------------------------------------ #
 #  Logging                                                             #
@@ -252,7 +253,7 @@ DIES_CA = ["Dil", "Dim", "Dmc", "Dij", "Div", "Dis", "Diu"]
 
 def _keyboard_dates() -> ReplyKeyboardMarkup:
     """Botonera amb demà fins a 7 dies + opció manual."""
-    avui = date.today()
+    avui = local_today()
     buttons = []
     row = []
     for i in range(1, 8):
@@ -270,7 +271,7 @@ def _keyboard_dates() -> ReplyKeyboardMarkup:
 
 def _keyboard_sales_dates() -> ReplyKeyboardMarkup:
     """Botonera per vendes: avui i dies enrere + opcio manual."""
-    avui = date.today()
+    avui = local_today()
     buttons = []
     row = []
     for i in range(0, 8):
@@ -472,9 +473,9 @@ def _parse_data(text: str) -> str | None:
     """
     t = text.strip().lower()
     if t in ("avui", "hoy", "today", ""):
-        return date.today().strftime("%d/%m/%Y")
+        return local_today().strftime("%d/%m/%Y")
     if t in ("demà", "dema", "mañana", "tomorrow"):
-        return (date.today() + timedelta(days=1)).strftime("%d/%m/%Y")
+        return (local_today() + timedelta(days=1)).strftime("%d/%m/%Y")
 
     # Format complet DD/MM/YYYY
     try:
@@ -488,10 +489,10 @@ def _parse_data(text: str) -> str | None:
     if m:
         d_str = m.group(1).zfill(2)
         mo_str = m.group(2).zfill(2)
-        year = date.today().year
+        year = local_today().year
         try:
             d_test = datetime.strptime(f"{d_str}/{mo_str}/{year}", "%d/%m/%Y")
-            if d_test.date() < date.today():
+            if d_test.date() < local_today():
                 year += 1
         except ValueError:
             return None
@@ -505,7 +506,7 @@ def _next_date_for_day(day: int) -> date | None:
     if day < 1 or day > 31:
         return None
 
-    today = date.today()
+    today = local_today()
     year = today.year
     month = today.month
     for _ in range(14):
@@ -530,9 +531,9 @@ def _parse_all_orders_date(text: str) -> str | None:
 
     t = text.strip().lower()
     if re.search(r"\b(avui|hoy|today)\b", t):
-        return date.today().strftime("%d/%m/%Y")
+        return local_today().strftime("%d/%m/%Y")
     if re.search(r"\b(demà|dema|mañana|tomorrow)\b", t):
-        return (date.today() + timedelta(days=1)).strftime("%d/%m/%Y")
+        return (local_today() + timedelta(days=1)).strftime("%d/%m/%Y")
 
     match = re.search(r"\b(?:dia|del|pel)\s+(\d{1,2})\b", t)
     if not match:
@@ -1605,9 +1606,9 @@ def _operational_request_date(text: str) -> tuple[str, str]:
     if parsed:
         return _to_mcp_date(parsed), parsed
     t = _normalize_plain_text(text)
-    target = date.today() + timedelta(days=1)
+    target = local_today() + timedelta(days=1)
     if "avui" in t:
-        target = date.today()
+        target = local_today()
     return target.isoformat(), target.strftime("%d/%m/%Y")
 
 
@@ -3976,7 +3977,7 @@ async def auto_envia_comandes():
 def _auto_envia_dins_finestra_cron(now: datetime | None = None) -> bool:
     """Evita que PM2 executi l'enviament nomes per arrencar o resurrectar l'app."""
     now = now or datetime.now()
-    return now.hour == 13 and now.minute <= 10
+    return (now.hour == 13 and now.minute <= 10) or (now.hour == 19 and 30 <= now.minute <= 40)
 
 
 async def _auto_send_client(data_mcp: str, client: dict, state: dict) -> tuple[bool, str | None]:
@@ -4019,7 +4020,7 @@ async def _auto_send_client(data_mcp: str, client: dict, state: dict) -> tuple[b
 
 
 async def _run_auto_envia_comandes(bot: Bot):
-    dema = date.today() + timedelta(days=1)
+    dema = local_today() + timedelta(days=1)
     data_display = dema.strftime("%d/%m/%Y")
     data_mcp = dema.strftime("%Y-%m-%d")
 

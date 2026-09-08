@@ -15,6 +15,7 @@ from google.genai.errors import ServerError
 from faster_whisper import WhisperModel
 
 from mcp_vendes import MCPVendes
+from services.local_time import local_today
 
 
 logger = logging.getLogger(__name__)
@@ -84,11 +85,12 @@ class GeminiHitAssistant:
         return await self._request_user_selection(question, clean[:10], selection_type)
 
     def _system_instruction(self) -> str:
-        today = date.today().isoformat()
+        today = local_today().isoformat()
         return (
             "Ets l'assistent del bot de HitSystems. Parlem en catala. Respon sempre en catala, "
             "excepte si l'usuari demana explicitament un altre idioma. Sigues clar i breu. "
-            f"La data d'avui es {today}. "
+            f"La data d'avui (zona horaria Europe/Madrid) es {today}. "
+            "Quan l'usuari digui 'avui', has d'usar exactament aquesta data; quan digui 'dema', usa aquesta data mes un dia. "
             "Quan la consulta sigui sobre clients, articles, comandes, albarans o vendes, usa les eines MCP disponibles "
             "en lloc d'inventar dades. No inventis codis, quantitats, resultats ni dates. "
             "Per consultes de vendes (aggregated_sales_day, aggregated_sales_hour), usa aquests codis de botiga coneguts: "
@@ -1064,7 +1066,7 @@ class GeminiHitAssistant:
         try:
             base_date = datetime.strptime(reference_date, "%Y-%m-%d").date()
         except ValueError:
-            base_date = date.today()
+            base_date = local_today()
 
         articles: dict[int, dict] = {}
         for offset in range(1, max(1, days_back) + 1):

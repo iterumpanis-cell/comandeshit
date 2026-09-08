@@ -5,6 +5,7 @@ Usa comandes ESC/POS compatibles amb Star.
 import asyncio
 import logging
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,54 @@ def _format_ticket(client_name: str, data: str, linies: list) -> bytes:
     buf += CUT
 
     return bytes(buf)
+
+
+def _money(value) -> Decimal:
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def format_ticket_valorat_text(client_name: str, data: str, linies: list, iva_rate: Decimal = Decimal("0.04")) -> str:
+    """Genera un albara valorat en text net per a la cua CloudPRNT."""
+    lines = [
+        "ITERUM PANIS",
+        "Obrador",
+        "",
+        f"Client: {client_name}",
+        f"Data:   {data}",
+        "----------------------------------------",
+        "QTY  ARTICLE",
+        "----------------------------------------",
+    ]
+    base_total = Decimal("0.00")
+    vat_total = Decimal("0.00")
+    printed = 0
+    for line in linies:
+        qty = Decimal(str(line.get("served", 0) or 0))
+        if qty <= 0:
+            continue
+        name = str(line.get("nm") or line.get("artName") or line.get("name") or "?")
+        price = _money(line.get("price", line.get("p", 0)))
+        base = _money(line.get("amount", line.get("i", price * qty)))
+        vat = _money(base * iva_rate)
+        base_total += base
+        vat_total += vat
+        printed += 1
+        lines.extend([
+            f"{qty:g}  {name}",
+            f"     Preu: {price:.2f} EUR   Base: {base:.2f} EUR",
+            f"     IVA: {iva_rate * 100:.0f}%       Quota: {vat:.2f} EUR",
+        ])
+    if not printed:
+        raise ValueError("La comanda no te linies servides valorables")
+    lines.extend([
+        "----------------------------------------",
+        f"BASE IVA {iva_rate * 100:.0f}%: {base_total:.2f} EUR",
+        f"QUOTA IVA {iva_rate * 100:.0f}%: {vat_total:.2f} EUR",
+        f"TOTAL ALBARA: {base_total + vat_total:.2f} EUR",
+        "",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 async def imprimir_text_directe(text_escpos: str) -> dict:
