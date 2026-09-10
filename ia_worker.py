@@ -19,6 +19,7 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from dotenv import load_dotenv
+from security import redact_text
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,12 +60,7 @@ def _ensure_dirs() -> None:
 
 def _redact(text: str) -> str:
     import re
-
-    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
-    text = re.sub(r"bot\d+:[A-Za-z0-9_\-]+", "bot<TELEGRAM_TOKEN>", text)
-    text = re.sub(r"(TELEGRAM_TOKEN=)[^\s]+", r"\1<SECRET>", text)
-    text = re.sub(r"(MCP_URL=)[^\s]+", r"\1<SECRET>", text)
-    return text
+    return redact_text(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text))
 
 
 def _telegram_send(text: str) -> None:
@@ -122,11 +118,19 @@ def _run_opencode(task: dict) -> tuple[int, str]:
         str(TEST_DIR),
         "--title",
         f"IA Telegram {task.get('id', '')}",
-        "--dangerously-skip-permissions",
         prompt,
     ]
     logging.info("Executant OpenCode per tasca %s", task.get("id"))
-    env = os.environ.copy()
+    # Pass only the settings needed by the worker, never tokens or arbitrary host env.
+    env = {
+        key: os.environ[key]
+        for key in (
+            "PATH", "PATHEXT", "COMSPEC", "HOME", "USERPROFILE", "LOCALAPPDATA",
+            "APPDATA", "SYSTEMROOT", "TEMP", "TMP", "PROGRAMDATA", "PROGRAMFILES",
+            "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)",
+        )
+        if os.environ.get(key)
+    }
     env.update({"CI": "1", "NO_COLOR": "1", "TERM": "dumb"})
     completed = subprocess.run(
         cmd,

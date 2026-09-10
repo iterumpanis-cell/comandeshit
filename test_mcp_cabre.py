@@ -2,9 +2,11 @@
 import asyncio
 import sys
 sys.path.insert(0, r"C:\botTel")
-from mcp_vendes import MCPVendes
+from mcp_vendes import MCPVendes, MCP_URL
+from security import require_real_mcp
 
 async def main():
+    require_real_mcp(MCP_URL)
     mcp = MCPVendes()
 
     print("=== search_client 'cal cabre' ===")

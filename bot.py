@@ -1745,6 +1745,8 @@ def run_bot():
         get_admin_user_id=_get_admin_user_id,
         get_copies=_get_copies,
         base_dir=Path(__file__).resolve().parent,
+        get_auth=_get_user_profile,
+        autoritzat=autoritzat,
     )
     app.add_error_handler(error_handler)
 

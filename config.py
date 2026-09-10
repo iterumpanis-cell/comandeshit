@@ -1,9 +1,10 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 
 def _get_bool(name: str, default: bool) -> bool:

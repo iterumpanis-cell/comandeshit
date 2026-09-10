@@ -27,6 +27,8 @@ def build_callback_handler(
     get_admin_user_id,
     get_copies,
     base_dir,
+    get_auth=None,
+    autoritzat=None,
 ):
     async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Gestiona callbacks inline: edició de comandes, confirmacions i autoritzacions."""
@@ -35,12 +37,24 @@ def build_callback_handler(
         data = query.data
 
         if data.startswith("reprint_order:"):
+            user_id = query.from_user.id if query.from_user else None
+            authorized = autoritzat(update) if autoritzat else False
+            if not authorized:
+                await query.message.reply_text("❌ No autoritzat.")
+                return
             try:
                 _, data_mcp, client_raw = data.split(":", 2)
                 client_code = int(client_raw)
             except Exception:
                 await query.edit_message_text("❌ No puc identificar l'albarà a reimprimir.")
                 return
+            profile = get_auth(user_id) if get_auth and user_id is not None else None
+            is_admin = user_id == get_admin_user_id()
+            scoped_client = profile.get("client_code") if isinstance(profile, dict) else None
+            if not is_admin:
+                if scoped_client is None or int(scoped_client) != client_code:
+                    await query.message.reply_text("❌ No tens permís per reimprimir aquest client.")
+                    return
             copies = get_copies(client_code)
             await query.edit_message_text(f"⏳ Reimprimint albarà ({copies} còpia/es)...")
             result = await mcp.imprimir_albarans(data_mcp, client_code, copies)

@@ -40,14 +40,18 @@ def _replace_env_value(path: Path, key: str, value: str) -> bool:
 
 
 def persist_mcp_url(url: str, base_dir: Path) -> list[str]:
-    base = base_dir.resolve()
-    targets = [
-        (base / ".env", "MCP_URL"),
-        (base.parent / "hitsystems-bot" / ".env", "MCP_URL"),
-        (base.parent / "FACTURES REBUDES ITERUM 2026" / ".env", "HITSYSTEMS_MCP_URL"),
-    ]
+    base = Path(base_dir).resolve(strict=True)
+    if not base.is_dir():
+        raise ValueError(f"El directori base no és un directori: {base}")
+
+    # Keep runtime persistence strictly inside the supplied test project.
+    target = (base / ".env").resolve()
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"Path de persistència fora del directori base: {target}") from exc
+
     updated = []
-    for path, key in targets:
-        if _replace_env_value(path, key, url):
-            updated.append(str(path))
+    if _replace_env_value(target, "MCP_URL", url):
+        updated.append(str(target))
     return updated

@@ -10,7 +10,8 @@ import sys
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-from mcp_vendes import MCPVendes
+from mcp_vendes import MCPVendes, MCP_URL
+from security import require_real_mcp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ DATA    = "2026-03-30"
 
 
 async def main():
+    require_real_mcp(MCP_URL)
     mcp = MCPVendes()
 
     # 1. Veure estat inicial
