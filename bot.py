@@ -2026,12 +2026,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
 
     if data.startswith("reprint_order:"):
+        if not autoritzat(update):
+            await query.message.reply_text("❌ No autoritzat.")
+            return
         try:
             _, data_mcp, client_raw = data.split(":", 2)
             client_code = int(client_raw)
         except Exception:
             await query.edit_message_text("❌ No puc identificar l'albarà a reimprimir.")
             return
+        if not _is_admin(update):
+            scoped_client, _ = _bound_client(update)
+            if scoped_client != client_code:
+                await query.message.reply_text("❌ No tens permís per reimprimir aquest client.")
+                return
         copies = _get_copies(client_code)
         await query.edit_message_text(f"⏳ Reimprimint albarà ({copies} còpia/es)...")
         result = await mcp.imprimir_albarans(data_mcp, client_code, copies)
@@ -3977,7 +3985,11 @@ async def auto_envia_comandes():
 def _auto_envia_dins_finestra_cron(now: datetime | None = None) -> bool:
     """Evita que PM2 executi l'enviament nomes per arrencar o resurrectar l'app."""
     now = now or datetime.now()
-    return (now.hour == 13 and now.minute <= 10) or (now.hour == 19 and 30 <= now.minute <= 40)
+    cap_de_setmana = now.weekday() >= 5
+    laborable = now.weekday() < 5
+    return (cap_de_setmana and now.hour == 13 and now.minute <= 10) or (
+        laborable and now.hour == 19 and 30 <= now.minute <= 40
+    )
 
 
 async def _auto_send_client(data_mcp: str, client: dict, state: dict) -> tuple[bool, str | None]:

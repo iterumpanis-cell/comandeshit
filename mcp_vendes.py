@@ -7,12 +7,12 @@ import difflib
 import json
 import logging
 import os
-import time
 import unicodedata
+from pathlib import Path
 import aiohttp
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -52,18 +52,17 @@ class MCPVendes:
         self._session_id: str | None = None
         self._lock = asyncio.Lock()
         self._req_id = 0
-        self._use_ssl = True
-        self._ssl_disabled_at: float | None = None
-        self._SSL_RETRY_INTERVAL = 24 * 3600  # torna a provar SSL cada 24h
 
     def _next_id(self) -> int:
         self._req_id += 1
         return self._req_id
 
     async def _call(self, method: str, params: dict) -> dict:
-        """Crida al servidor MCP. Si el certificat SSL ha caducat, desactiva la verificació automàticament."""
+        """Crida al servidor MCP amb verificació TLS obligatòria."""
         if not MCP_URL:
             raise RuntimeError("Falta configurar MCP_URL al fitxer .env")
+        if not MCP_URL.lower().startswith("https://"):
+            raise RuntimeError("MCP_URL ha de començar per https://; no s'accepten connexions sense TLS")
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -78,34 +77,19 @@ class MCPVendes:
             "params": params,
         }
 
-        # Si fa >24h que SSL està desactivat, torna a provar-lo
-        if not self._use_ssl and self._ssl_disabled_at and (time.time() - self._ssl_disabled_at) > self._SSL_RETRY_INTERVAL:
-            logger.info("Han passat 24h — tornant a provar amb SSL activat")
-            self._use_ssl = True
-            self._ssl_disabled_at = None
-            self._session_id = None
-
-        for ssl_attempt in range(2):
-            try:
-                async with aiohttp.ClientSession() as http:
-                    async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=self._use_ssl) as resp:
-                        new_sid = resp.headers.get("mcp-session-id")
-                        if new_sid:
-                            self._session_id = new_sid
-                        text = await resp.text()
-                        data = _parse_sse(text)
-                        if data is None:
-                            raise ValueError(f"Resposta inesperada: {text[:200]}")
-                        return data
-            except aiohttp.ClientConnectorCertificateError:
-                if ssl_attempt == 0 and self._use_ssl:
-                    logger.warning("Certificat SSL d'octomes.com caducat — desactivant verificació SSL automàticament")
-                    self._use_ssl = False
-                    self._ssl_disabled_at = time.time()
-                    self._session_id = None
-                    continue
-                raise
-        raise RuntimeError("No s'ha pogut connectar al servidor MCP")
+        try:
+            async with aiohttp.ClientSession() as http:
+                async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=True) as resp:
+                    new_sid = resp.headers.get("mcp-session-id")
+                    if new_sid:
+                        self._session_id = new_sid
+                    text = await resp.text()
+                    data = _parse_sse(text)
+                    if data is None:
+                        raise ValueError(f"Resposta inesperada: {text[:200]}")
+                    return data
+        except aiohttp.ClientConnectorCertificateError as exc:
+            raise RuntimeError("Certificat TLS del servidor MCP no vàlid; connexió rebutjada") from exc
 
     async def _ensure_session(self):
         """Inicialitza sessió si no n'hi ha."""
