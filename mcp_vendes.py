@@ -7,9 +7,11 @@ import difflib
 import json
 import logging
 import os
+import ssl
 import unicodedata
 from pathlib import Path
 import aiohttp
+import certifi
 from dotenv import load_dotenv
 from security import mcp_call_allowed, redact, redact_text
 
@@ -18,6 +20,7 @@ load_dotenv(Path(__file__).with_name(".env"), override=True)
 logger = logging.getLogger(__name__)
 
 MCP_URL = os.getenv("MCP_URL", "").strip()
+TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 def _parse_sse(text: str) -> dict | None:
@@ -81,7 +84,7 @@ class MCPVendes:
 
         try:
             async with aiohttp.ClientSession() as http:
-                async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=True) as resp:
+                async with http.post(MCP_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=TLS_CONTEXT) as resp:
                     new_sid = resp.headers.get("mcp-session-id")
                     if new_sid:
                         self._session_id = new_sid

@@ -1,5 +1,6 @@
 python-telegram-bot[job-queue]>=20.7
 playwright>=1.48.0
 python-dotenv>=1.0.1
+certifi>=2024.0.0
 google-genai>=1.30.0
 faster-whisper>=1.0.0
